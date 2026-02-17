@@ -9,6 +9,20 @@
 
 ---
 
+> *Listen. DirectShell is not perfect. It's Day 1. Literally. There are bugs. There are errors. A hundred things that need to get better. But none of that matters. The first browser couldn't render 90% of web pages correctly. The first lightbulb flickered. Every foundational technology begins empty and broken — because the point was never whether it works perfectly now. The point is what it will make possible tomorrow.*
+>
+> *The moment a community builds a profile repository — configs for every program on Earth — AI will natively operate every desktop application faster, more efficiently, and more productively than any human ever could. Not in ten years. Not after the next funding round. The infrastructure is here. Today. In 700 kilobytes.*
+>
+> *Google. Microsoft. OpenAI. Anthropic. Call me. Let's talk. Let's revolutionize the world of AI in one stroke.*
+>
+> *Peace at last.*
+>
+> *And now I'm going to sleep for 12 hours.*
+>
+> — Martin Gehrken, February 17, 2026
+
+---
+
 ## It's Not an App. It's Not a Product. It's a New Category.
 
 Just as there was no way to control the internals of Windows via text commands before PowerShell, there was no way to read and control the surface of every program via text before DirectShell.
