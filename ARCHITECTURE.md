@@ -366,8 +366,8 @@ The AI (Claude Opus 4.6, running in a separate CLI terminal) queried the databas
 
 ```sql
 -- Find a specific message from the entire chat history
-SELECT name, y FROM elements WHERE name LIKE '%lars ist happy%nda%'
-→ "ich denke ja. also lars ist happy mit der nda"
+SELECT name, y FROM elements WHERE name LIKE '%meeting%tomorrow%'
+→ "sure, the meeting tomorrow works for me"
 
 -- Read the last message and its response
 SELECT name FROM elements WHERE role='Text' AND length(name)>10 ORDER BY y DESC LIMIT 3
@@ -376,8 +376,8 @@ SELECT name FROM elements WHERE role='Text' AND length(name)>10 ORDER BY y DESC 
 SELECT name, value FROM elements WHERE role='Hyperlink' AND offscreen=0
 
 -- Identify the logged-in user
-SELECT name FROM elements WHERE name LIKE '%Martin%'
-→ "Martin Gehrken", "Max Plan"
+SELECT name FROM elements WHERE name LIKE '%User%'
+→ "User Profile", "Pro Plan"
 ```
 
 ### 7.2 What This Proves

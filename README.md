@@ -9,8 +9,7 @@
 <p align="center">
   <a href="https://youtu.be/nvZobyt0KBg">Watch the Demo</a> &middot;
   <a href="LLM_GUIDE.md">LLM Quick Start Guide</a> &middot;
-  <a href="Dokumentation/DEVTO_ARTICLE.pdf">Read the Full Article</a> &middot;
-  <a href="Dokumentation/2026-02-16_Genesis_Session.txt">Read the Genesis Session</a>
+  <a href="Dokumentation/PAPER.md">Read the Whitepaper</a>
 </p>
 
 ---
@@ -238,6 +237,22 @@ The MCP server exposes DirectShell's capabilities as structured tool calls that 
 
 > **Important:** The `--profiles` path must point to the same `ds_profiles/` directory where `directshell.exe` writes its databases. If you run the EXE from the repo root, that's `./ds_profiles/`.
 
+### API Key for `ds_update_view`
+
+The `ds_update_view` tool sends accessibility data to a fast, cheap LLM (Gemini Flash 2.5 Lite via [OpenRouter](https://openrouter.ai)) which translates raw element trees into human-readable tool lists. This requires an API key:
+
+```bash
+# Option 1: Environment variable
+export OPENROUTER_API_KEY=your_key_here
+
+# Option 2: .env file (in ds-mcp/ or repo root)
+echo "OPENROUTER_API_KEY=your_key_here" > .env
+```
+
+Get a key at [openrouter.ai/keys](https://openrouter.ai/keys). Cost is ~$0.001-0.01 per `ds_update_view` call.
+
+> All other tools (`ds_click`, `ds_text`, `ds_type`, `ds_key`, `ds_query`, etc.) work without any API key — they operate directly through the local accessibility layer.
+
 With this, any LLM using MCP can read and control any Windows application through natural language.
 
 ---
@@ -298,8 +313,10 @@ DirectShell does not bypass access controls. It does not inject code into other 
 - [`BRAINSTORM.md`](BRAINSTORM.md) — Original vision and design decisions
 - [`Dokumentation/ARCHITECTURE.md`](Dokumentation/ARCHITECTURE.md) — Technical reference (code-level)
 - [`Dokumentation/PAPER.md`](Dokumentation/PAPER.md) — Academic whitepaper
-- [`Dokumentation/DEVTO_ARTICLE.pdf`](Dokumentation/DEVTO_ARTICLE.pdf) — Full article (PDF)
-- [`Dokumentation/2026-02-16_Genesis_Session.txt`](Dokumentation/2026-02-16_Genesis_Session.txt) — The complete build session: 8.5 hours from idea to working prototype
+
+### Dev Blog
+
+- [`BLOG_DAY2.md`](BLOG_DAY2.md) — Day 2: When an AI Learns to Use a Browser for the First Time (Learnings system, CDP integration)
 
 ---
 

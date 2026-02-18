@@ -16,7 +16,9 @@ use std::io::Write as IoWrite;
 use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering::SeqCst};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::net::TcpStream;
+use std::process::Command;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, params};
 use windows::core::*;
 use windows::Win32::Foundation::*;
@@ -1338,6 +1340,7 @@ fn is_extended_key(vk: VIRTUAL_KEY) -> bool {
 }
 
 /// Send a single VK key down+up via SendInput
+#[allow(dead_code)]
 unsafe fn send_vk(vk: VIRTUAL_KEY) {
     let ext = if is_extended_key(vk) { KEYEVENTF_EXTENDEDKEY } else { KEYBD_EVENT_FLAGS(0) };
     let inputs = [
@@ -1366,6 +1369,7 @@ unsafe fn send_vk(vk: VIRTUAL_KEY) {
 }
 
 /// Send a VK modifier key DOWN only
+#[allow(dead_code)]
 unsafe fn send_vk_down(vk: VIRTUAL_KEY) {
     let ext = if is_extended_key(vk) { KEYEVENTF_EXTENDEDKEY } else { KEYBD_EVENT_FLAGS(0) };
     let input = [INPUT {
@@ -1382,6 +1386,7 @@ unsafe fn send_vk_down(vk: VIRTUAL_KEY) {
 }
 
 /// Send a VK modifier key UP only
+#[allow(dead_code)]
 unsafe fn send_vk_up(vk: VIRTUAL_KEY) {
     let ext = if is_extended_key(vk) { KEYEVENTF_EXTENDEDKEY } else { KEYBD_EVENT_FLAGS(0) };
     let input = [INPUT {
@@ -1399,6 +1404,8 @@ unsafe fn send_vk_up(vk: VIRTUAL_KEY) {
 
 /// Parse and send a key combo like "ctrl+shift+a" or "enter" or "f5"
 /// Supports any combination of modifiers + one main key.
+/// Uses SendInput (global) — used by keyboard hook where target is already focused.
+#[allow(dead_code)]
 unsafe fn send_key_combo(combo: &str) {
     let parts: Vec<&str> = combo.split('+').map(|s| s.trim()).collect();
     let mut modifiers: Vec<VIRTUAL_KEY> = Vec::new();
@@ -1427,6 +1434,119 @@ unsafe fn send_key_combo(combo: &str) {
     for &m in modifiers.iter().rev() { send_vk_up(m); }
 
     log(&format!("key: sent '{}'", combo));
+}
+
+// ── Non-Blocking Input (PostMessage-based, window-independent) ──
+
+/// Build the lParam for WM_KEYDOWN/WM_KEYUP messages.
+unsafe fn make_key_lparam(vk: VIRTUAL_KEY, extended: bool, key_up: bool) -> LPARAM {
+    let scan = MapVirtualKeyW(vk.0 as u32, MAP_VIRTUAL_KEY_TYPE(0) /*MAPVK_VK_TO_VSC*/) as i32;
+    let mut lp: i32 = 1; // repeat count = 1
+    lp |= (scan & 0xFF) << 16; // scan code bits 16-23
+    if extended { lp |= 1 << 24; } // extended key flag
+    if key_up {
+        lp |= 1 << 30; // previous key state = was down
+        lp |= 1 << 31; // transition state = being released
+    }
+    LPARAM(lp as isize)
+}
+
+/// Find the child HWND that should receive keyboard input inside a window.
+/// Find the deepest child window suitable for keyboard input.
+/// For Chromium browsers, finds Chrome_RenderWidgetHostHWND.
+/// Falls back to AttachThreadInput focus discovery, then target itself.
+unsafe fn find_input_hwnd(target_hwnd: HWND) -> HWND {
+    // Strategy 1: Walk child windows looking for Chromium render widget
+    use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
+    static FOUND: AtomicIsize = AtomicIsize::new(0);
+    FOUND.store(0, Relaxed);
+
+    unsafe extern "system" fn enum_children(hwnd: HWND, _: LPARAM) -> BOOL {
+        let mut cls = [0u16; 128];
+        let len = GetClassNameW(hwnd, &mut cls);
+        let name = String::from_utf16_lossy(&cls[..len as usize]);
+        // Chromium render widget — this is where keyboard input goes
+        if name.contains("Chrome_RenderWidgetHostHWND")
+            || name.contains("MozillaWindowClass")
+            || name.contains("Internet Explorer_Server") {
+            FOUND.store(hwnd.0 as isize, Relaxed);
+            return FALSE; // stop enumeration
+        }
+        TRUE // continue
+    }
+
+    let _ = EnumChildWindows(target_hwnd, Some(enum_children), LPARAM(0));
+    let found = FOUND.load(Relaxed);
+    if found != 0 {
+        return HWND(found as *mut _);
+    }
+
+    // Strategy 2: AttachThreadInput to discover focused control
+    let our_tid = GetCurrentThreadId();
+    let target_tid = GetWindowThreadProcessId(target_hwnd, None);
+    if our_tid == target_tid {
+        let focus = GetFocus();
+        if !focus.0.is_null() { return focus; }
+        return target_hwnd;
+    }
+    let _ = AttachThreadInput(our_tid, target_tid, TRUE);
+    let focus = GetFocus();
+    let _ = AttachThreadInput(our_tid, target_tid, FALSE);
+    if !focus.0.is_null() { focus } else { target_hwnd }
+}
+
+/// Post a single Unicode character to the target window (non-blocking, no focus steal).
+unsafe fn post_char(target_hwnd: HWND, ch: char) {
+    let hwnd = find_input_hwnd(target_hwnd);
+    let _ = PostMessageW(hwnd, WM_CHAR, WPARAM(ch as usize), LPARAM(0));
+}
+
+/// Post a VK key down+up to the target window (non-blocking, no focus steal).
+unsafe fn post_vk(target_hwnd: HWND, vk: VIRTUAL_KEY) {
+    let hwnd = find_input_hwnd(target_hwnd);
+    let ext = is_extended_key(vk);
+    let _ = PostMessageW(hwnd, WM_KEYDOWN, WPARAM(vk.0 as usize), make_key_lparam(vk, ext, false));
+    let _ = PostMessageW(hwnd, WM_KEYUP, WPARAM(vk.0 as usize), make_key_lparam(vk, ext, true));
+}
+
+/// Post a VK modifier key DOWN to the target window.
+unsafe fn post_vk_down(target_hwnd: HWND, vk: VIRTUAL_KEY) {
+    let hwnd = find_input_hwnd(target_hwnd);
+    let ext = is_extended_key(vk);
+    let _ = PostMessageW(hwnd, WM_KEYDOWN, WPARAM(vk.0 as usize), make_key_lparam(vk, ext, false));
+}
+
+/// Post a VK modifier key UP to the target window.
+unsafe fn post_vk_up(target_hwnd: HWND, vk: VIRTUAL_KEY) {
+    let hwnd = find_input_hwnd(target_hwnd);
+    let ext = is_extended_key(vk);
+    let _ = PostMessageW(hwnd, WM_KEYUP, WPARAM(vk.0 as usize), make_key_lparam(vk, ext, true));
+}
+
+/// Parse and post a key combo to the target window (non-blocking, no focus steal).
+unsafe fn post_key_combo(target_hwnd: HWND, combo: &str) {
+    let parts: Vec<&str> = combo.split('+').map(|s| s.trim()).collect();
+    let mut modifiers: Vec<VIRTUAL_KEY> = Vec::new();
+    let mut main_key: Option<VIRTUAL_KEY> = None;
+
+    for part in &parts {
+        if let Some(vk) = key_to_vk(part) {
+            if matches!(vk, VK_CONTROL | VK_MENU | VK_SHIFT | VK_LWIN | VK_RWIN) {
+                modifiers.push(vk);
+            } else {
+                main_key = Some(vk);
+            }
+        } else {
+            log(&format!("postkey: unknown key '{}'", part));
+            return;
+        }
+    }
+
+    for &m in &modifiers { post_vk_down(target_hwnd, m); }
+    if let Some(mk) = main_key { post_vk(target_hwnd, mk); }
+    for &m in modifiers.iter().rev() { post_vk_up(target_hwnd, m); }
+
+    log(&format!("postkey: sent '{}'", combo));
 }
 
 /// Click on a UI element by name using UIA. Finds element, gets center, sends mouse click.
@@ -1458,29 +1578,54 @@ unsafe fn click_element(target_hwnd: HWND, element_name: &str) -> bool {
         }
     };
 
+    // Strategy 1: UIA InvokePattern — no mouse movement, no focus steal
+    if let Ok(pat) = elem.GetCurrentPattern(UIA_InvokePatternId) {
+        if let Ok(ip) = pat.cast::<IUIAutomationInvokePattern>() {
+            if ip.Invoke().is_ok() {
+                log(&format!("click: InvokePattern OK '{}'", element_name));
+                return true;
+            }
+        }
+    }
+
+    // Strategy 2: UIA TogglePattern (checkboxes, toggle buttons)
+    if let Ok(pat) = elem.GetCurrentPattern(UIA_TogglePatternId) {
+        if let Ok(tp) = pat.cast::<IUIAutomationTogglePattern>() {
+            if tp.Toggle().is_ok() {
+                log(&format!("click: TogglePattern OK '{}'", element_name));
+                return true;
+            }
+        }
+    }
+
+    // Strategy 3: UIA SelectionItemPattern (radio buttons, list items)
+    if let Ok(pat) = elem.GetCurrentPattern(UIA_SelectionItemPatternId) {
+        if let Ok(sp) = pat.cast::<IUIAutomationSelectionItemPattern>() {
+            if sp.Select().is_ok() {
+                log(&format!("click: SelectionItemPattern OK '{}'", element_name));
+                return true;
+            }
+        }
+    }
+
+    // Strategy 4: Fallback — SendInput (only if UIA patterns unavailable)
+    log(&format!("click: no UIA pattern, falling back to SendInput '{}'", element_name));
     let rect = match elem.CurrentBoundingRectangle() {
         Ok(r) => r,
         Err(e) => { log(&format!("click: rect FAIL: {e}")); return false; }
     };
-
-    // Center of element
     let cx = rect.left + (rect.right - rect.left) / 2;
     let cy = rect.top + (rect.bottom - rect.top) / 2;
-
-    // Convert to absolute coords for SendInput (0-65535 range)
     let screen_w = GetSystemMetrics(SM_CXSCREEN);
     let screen_h = GetSystemMetrics(SM_CYSCREEN);
     let abs_x = (cx as i32 * 65535 / screen_w) as i32;
     let abs_y = (cy as i32 * 65535 / screen_h) as i32;
-
     let inputs = [
         INPUT {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 {
                 mi: MOUSEINPUT {
-                    dx: abs_x,
-                    dy: abs_y,
-                    mouseData: 0,
+                    dx: abs_x, dy: abs_y, mouseData: 0,
                     dwFlags: MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN,
                     time: 0, dwExtraInfo: 0,
                 },
@@ -1490,9 +1635,7 @@ unsafe fn click_element(target_hwnd: HWND, element_name: &str) -> bool {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 {
                 mi: MOUSEINPUT {
-                    dx: abs_x,
-                    dy: abs_y,
-                    mouseData: 0,
+                    dx: abs_x, dy: abs_y, mouseData: 0,
                     dwFlags: MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP,
                     time: 0, dwExtraInfo: 0,
                 },
@@ -1500,11 +1643,12 @@ unsafe fn click_element(target_hwnd: HWND, element_name: &str) -> bool {
         },
     ];
     SendInput(&inputs, mem::size_of::<INPUT>() as i32);
-    log(&format!("click: '{}' @ {},{}", element_name, cx, cy));
+    log(&format!("click: SendInput fallback '{}' @ {},{}", element_name, cx, cy));
     true
 }
 
 /// Scroll the target window (up/down/left/right)
+#[allow(dead_code)]
 unsafe fn scroll_window(target_hwnd: HWND, direction: &str) {
     let (dx, dy): (i32, i32) = match direction.to_lowercase().as_str() {
         "up"    => (0, 120),    // WHEEL_DELTA = 120
@@ -1602,17 +1746,8 @@ fn process_injections() {
         log(&format!("action: id={} type='{}' target='{}' text='{}'",
             id, action, target_name, if text.len() > 50 { &text[..50] } else { &text }));
 
-        // Auto-focus: bring target to foreground ONLY when there's work to do
-        unsafe {
-            let fg = GetForegroundWindow();
-            let target = HWND(TARGET_HW.load(SeqCst) as *mut _);
-            if !target.0.is_null() && fg != target && GetAncestor(fg, GA_ROOT) != target {
-                send_vk_down(VK_MENU);
-                send_vk_up(VK_MENU);
-                let _ = SetForegroundWindow(target);
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        }
+        // No auto-focus: actions work via UIA patterns and PostMessage,
+        // independent of which window the user has in foreground.
 
         let ok = unsafe {
             let target = HWND(TARGET_HW.load(SeqCst) as *mut _);
@@ -1623,19 +1758,53 @@ fn process_injections() {
                 match action.as_str() {
                     "text" => inject_text(target, &text, &target_name),
                     "type" => {
+                        // Non-blocking: PostMessage to Chromium render widget
+                        let input_hwnd = find_input_hwnd(target);
+                        log(&format!("type: posting {} chars to hwnd 0x{:X}", text.len(), input_hwnd.0 as usize));
                         for ch in text.chars() {
                             match ch {
-                                '\t' => send_vk(VK_TAB),
-                                '\n' | '\r' => send_vk(VK_RETURN),
-                                _ => inject_char(ch),
+                                '\t' => post_vk(target, VK_TAB),
+                                '\n' | '\r' => post_vk(target, VK_RETURN),
+                                _ => {
+                                    // Full keyboard sequence: KEYDOWN → CHAR → KEYUP
+                                    let vk = VkKeyScanW(ch as u16);
+                                    let vk_code = (vk & 0xFF) as u16;
+                                    let scan = MapVirtualKeyW(vk_code as u32, MAP_VIRTUAL_KEY_TYPE(0));
+                                    let lp_down = LPARAM(((scan << 16) | 1) as isize);
+                                    let lp_up   = LPARAM(((scan << 16) | 1 | (1 << 30) | (1 << 31)) as isize);
+                                    let _ = PostMessageW(input_hwnd, WM_KEYDOWN, WPARAM(vk_code as usize), lp_down);
+                                    let _ = PostMessageW(input_hwnd, WM_CHAR, WPARAM(ch as usize), lp_down);
+                                    let _ = PostMessageW(input_hwnd, WM_KEYUP, WPARAM(vk_code as usize), lp_up);
+                                },
                             }
-                            std::thread::sleep(std::time::Duration::from_millis(15));
+                            std::thread::sleep(std::time::Duration::from_millis(5));
                         }
                         true
                     },
-                    "key"  => { send_key_combo(&text); true },
+                    "key"  => { post_key_combo(target, &text); true },
                     "click" => click_element(target, &target_name),
-                    "scroll" => { scroll_window(target, &text); true },
+                    "scroll" => {
+                        // PostMessage WM_MOUSEWHEEL to target — no cursor move
+                        let (dx, dy): (i32, i32) = match text.to_lowercase().as_str() {
+                            "up"    => (0, 120),
+                            "down"  => (0, -120),
+                            "left"  => (-120, 0),
+                            "right" => (120, 0),
+                            _ => { log(&format!("scroll: unknown '{}'", text)); (0, 0) }
+                        };
+                        if dy != 0 {
+                            let _ = PostMessageW(target, WM_MOUSEWHEEL,
+                                WPARAM((dy as u16 as usize) << 16),
+                                LPARAM(0));
+                        }
+                        if dx != 0 {
+                            let _ = PostMessageW(target, WM_MOUSEHWHEEL,
+                                WPARAM((dx as u16 as usize) << 16),
+                                LPARAM(0));
+                        }
+                        log(&format!("scroll: posted '{}'", text));
+                        true
+                    },
                     _ => { log(&format!("action: unknown type '{}'", action)); false }
                 }
             }
@@ -1791,8 +1960,90 @@ unsafe fn find_snap(me: HWND) -> Option<HWND> {
 }
 
 // ── Snap / Unsnap ───────────────────────────────────
+/// Check if target is a browser and CDP is available.
+/// Returns true = proceed with snap. Returns false = snap aborted (browser relaunching).
+unsafe fn ensure_cdp(target: HWND) -> bool {
+    let mut buf = [0u16; 256];
+    let len = GetWindowTextW(target, &mut buf);
+    let title = String::from_utf16_lossy(&buf[..len as usize]).to_lowercase();
+
+    // Detect browser by window title
+    let is_browser = title.contains("chrome") || title.contains("opera")
+        || title.contains("firefox") || title.contains("edge");
+    if !is_browser { return true; } // Not a browser, snap normally
+
+    // Try connecting to CDP
+    if TcpStream::connect_timeout(
+        &"127.0.0.1:9222".parse().unwrap(),
+        Duration::from_millis(200),
+    ).is_ok() {
+        log("cdp: already active on :9222");
+        return true;
+    }
+
+    // Get EXE path BEFORE showing popup (process is still alive)
+    let mut pid: u32 = 0;
+    GetWindowThreadProcessId(target, Some(&mut pid));
+    let mut exe_path = String::new();
+    if pid != 0 {
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        use windows::Win32::System::ProcessStatus::GetModuleFileNameExW;
+        if let Ok(hproc) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) {
+            let mut path_buf = [0u16; 512];
+            let plen = GetModuleFileNameExW(hproc, None, &mut path_buf);
+            if plen > 0 {
+                exe_path = String::from_utf16_lossy(&path_buf[..plen as usize]);
+            }
+            let _ = windows::Win32::Foundation::CloseHandle(hproc);
+        }
+    }
+    if exe_path.is_empty() {
+        log("cdp: could not determine browser exe path, skipping CDP");
+        return true; // Can't fix it, snap anyway
+    }
+
+    log(&format!("cdp: not active, asking user to close browser ({})", exe_path));
+
+    // Free-floating MessageBox (HWND(0) = no parent, not modal to the browser)
+    let msg = "DirectShell needs Chrome DevTools Protocol for full page access.\n\n\
+               Close your browser, then click OK.\n\
+               DirectShell will restart it with CDP enabled.\n\n\
+               (You can then snap again.)";
+    let msg_w: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+    let title_w: Vec<u16> = "DirectShell \u{2014} CDP Setup".encode_utf16().chain(std::iter::once(0)).collect();
+
+    MessageBoxW(
+        HWND(std::ptr::null_mut()),
+        PCWSTR(msg_w.as_ptr()),
+        PCWSTR(title_w.as_ptr()),
+        MB_OK | MB_ICONINFORMATION,
+    );
+
+    // Wait for browser to actually close (up to 15 sec)
+    for _ in 0..30 {
+        if !IsWindow(target).as_bool() { break; }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // Relaunch with CDP
+    log(&format!("cdp: launching {} with --remote-debugging-port=9222", exe_path));
+    let _ = Command::new(&exe_path)
+        .arg("--remote-debugging-port=9222")
+        .arg("--remote-allow-origins=*")
+        .spawn();
+
+    false // Don't snap — browser is restarting, user snaps again
+}
+
 unsafe fn do_snap(me: HWND, target: HWND) {
     log(&format!("do_snap: me=0x{:X} target=0x{:X}", me.0 as usize, target.0 as usize));
+
+    // CDP: If target is a browser without CDP, bounce the snap
+    if !ensure_cdp(target) {
+        log("do_snap: ABORTED — CDP setup in progress, user snaps again after browser restart");
+        return;
+    }
+
     let mut rc = RECT::default();
     let _ = GetWindowRect(target, &mut rc);
     let (x, y, w, h) = (rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);

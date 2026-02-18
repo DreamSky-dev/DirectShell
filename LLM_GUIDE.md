@@ -28,16 +28,17 @@ It works by reading the **Windows Accessibility Tree** — the same structured d
 
 ---
 
-## The 13 Tools You Have
+## Your Tools
 
-### Perception (Reading the Screen)
+### Overview & Perception
 
 | Tool | What It Does | Token Cost | When to Use |
 |------|-------------|:----------:|-------------|
-| `ds_status` | Shows which app is snapped and paths to all output files | ~20 | **First call every time.** Always start here. |
-| `ds_state` | Compact numbered list of all operable elements | ~200–500 | **Primary perception.** Your go-to for "what can I interact with?" |
+| `ds_update_view` | **Your primary tool.** Sends a11y tree + operable elements to a fast LLM that returns: what's on screen, every actionable tool, and visible data values. Also lists available learnings. | ~100–300 | **First call. Every time.** After every navigation. After every page change. This IS your eyes. |
+| `ds_act` | Execute an action by tool number from `ds_update_view` output | ~20 | After `ds_update_view` gives you a numbered tool list — just pick a number |
+| `ds_status` | Shows which app is snapped and file paths | ~20 | Debugging connection issues |
+| `ds_state` | Raw numbered list of operable elements | ~200–500 | Fallback when `ds_update_view` is unavailable |
 | `ds_screen` | Full screen reader view: focus, inputs, all visible content | ~1,000–3,000 | When you need to **read content** (chat messages, documents, articles) |
-| `ds_elements` | All interactive elements with input type classification | ~500–1,500 | When `ds_state` isn't detailed enough |
 | `ds_find` | Search elements by name pattern (SQL LIKE) | ~50–200 | When you're looking for a **specific element** by name |
 | `ds_query` | Run any SQL SELECT against the element database | ~50–200 | **Most powerful tool.** Ask any question about the UI. |
 | `ds_events` | Get only what **changed** since your last check | ~50–200 | **After an action.** See what happened without re-reading everything. |
@@ -53,10 +54,11 @@ It works by reading the **Windows Accessibility Tree** — the same structured d
 | `ds_scroll` | Scroll in a direction | Fine-grained scrolling inside panels |
 | `ds_batch` | Execute multiple actions in sequence | Multi-step workflows (click, type, tab, type, click) |
 
-### Profiles (Memory Across Sessions)
+### Learning (Organic Memory)
 
-| Tool | What It Does |
-|------|-------------|
+| Tool | What It Does | When to Use |
+|------|-------------|-------------|
+| `ds_learn` | Read or write per-app learnings files | **Before acting:** read tips for this app. **After discovering something:** save it. |
 | `ds_profile_list` | List all known app profiles |
 | `ds_profile_save` | Save semantic element mappings for an app |
 | `ds_profile_get` | Load a saved profile |
@@ -65,38 +67,55 @@ It works by reading the **Windows Accessibility Tree** — the same structured d
 
 ## Your Workflow (Step by Step)
 
-### Step 1: Check What's Snapped
+### Step 1: See the Screen
 
 ```
-→ ds_status()
+→ ds_update_view()
 ```
 
-This tells you which application DirectShell is attached to and where the database files are. **Always start here.**
+**This is your primary tool. Call it first. Call it often.** It returns three things:
 
-### Step 2: Read the Screen
+1. **SCREEN** — A 2-3 sentence description of what a human would see right now
+2. **TOOLS** — A numbered list of every actionable element (buttons, fields, links)
+3. **DATA** — Interesting values visible on the page (prices, counts, names)
+
+It also tells you if **learnings** exist for this app — read them before acting.
+
+Example response:
+```
+screen: "Google Sheets spreadsheet with 3 columns (Name, Price, Category) and 12 rows of product data."
+tools:
+  [1] click|File| Open the File menu
+  [2] click|Edit| Open the Edit menu
+  [3] type|Name Box| Enter a cell reference (e.g. A1)
+  [4] type|Formula Bar| Enter a formula or value
+  [5] click|Sheet1| Switch to Sheet1 tab
+tool_count: 5
+learnings: ["sheets"]
+learnings_hint: "Read learnings BEFORE acting: ds_learn('opera', 'sheets')"
+```
+
+### Step 2: Check Learnings (If Available)
 
 ```
-→ ds_state()
+→ ds_learn("opera", "sheets")
 ```
 
-You'll get a numbered list like:
-
-```
-[1] [keyboard] "Search Box" @ 100,200 (300x30)
-[2] [click] "Save" @ 500,600 (80x25)
-[3] [click] "Cancel" @ 600,600 (80x25)
-[4] [keyboard] "Email" @ 100,300 (300x30)
-```
-
-The prefix tells you HOW to interact:
-- `[keyboard]` → Use `ds_text` or `ds_type` to enter text
-- `[click]` → Use `ds_click` to click it
-- `[select]` → Use `ds_click` to open, then `ds_type` to search
+If `ds_update_view` listed available learnings, **read them before doing anything**. They contain tips and quirks discovered in previous sessions — things like "Tab moves to next cell, Enter moves to next row" or "Pad title rows with tabs to avoid column misalignment."
 
 ### Step 3: Act
 
+Two ways to execute actions:
+
+**Option A — Use tool numbers from `ds_update_view`:**
 ```
-→ ds_click("Save")                              # Click a button
+→ ds_act(4, text="=SUM(A1:A10)")    # Type into tool [4] (Formula Bar)
+→ ds_act(1)                           # Click tool [1] (File menu)
+```
+
+**Option B — Use named tools directly:**
+```
+→ ds_click("Save")                              # Click a button by name
 → ds_text("hello@example.com", target="Email")   # Set text in a field
 → ds_type("Hello World")                          # Type into focused element
 → ds_key("ctrl+s")                                # Send a keyboard shortcut
@@ -105,10 +124,21 @@ The prefix tells you HOW to interact:
 ### Step 4: Verify
 
 ```
-→ ds_events()
+→ ds_update_view()   # See the new state after your action
+→ ds_events()        # Or just see what changed (~50 tokens)
 ```
 
-This returns only what **changed** — ~50 tokens instead of re-reading the full tree (~5,000 tokens). Use this after every action to confirm it worked.
+### Step 5: Save What You Learned
+
+When you discover something useful — a quirk, a workaround, a best practice — **save it**:
+
+```
+→ ds_learn("opera", "sheets", append="Tab = next cell, Enter = next row. Don't use Enter in empty rows.")
+→ ds_learn("notepad", "general", append="ds_text works perfectly. No need for ds_type.")
+→ ds_learn("discord", "chat", append="Must use ds_type for chat input, ds_text is rejected.")
+```
+
+Next time any LLM opens the same app, these learnings load automatically. **Every mistake you save prevents the same mistake for everyone who comes after you.**
 
 ---
 
@@ -195,9 +225,28 @@ You can natively operate **any Windows application**:
 
 ---
 
-## Building App Profiles
+## Building Knowledge (Profiles + Learnings)
 
-When you learn how an application works — which elements do what, what the workflow patterns are — you can **save that knowledge** for next time:
+DirectShell has two complementary memory systems:
+
+### Learnings — Operational Experience
+
+Learnings are per-app, per-context text files stored in `ds_profiles/learnings/`. They capture **what works and what doesn't** — the kind of knowledge that only comes from trial and error.
+
+```python
+# Save a discovery
+ds_learn("opera", "sheets", append="Tab = next cell. Enter = next row but returns to LAST SELECTION column, not column A.")
+
+# Read before acting
+ds_learn("opera", "sheets")
+# → Returns all accumulated tips for Google Sheets in Opera
+```
+
+When you call `ds_update_view()`, it automatically tells you which learnings exist. **Read them before acting.** This is organic learning: Try → Fail → Learn → Save → Do better next time.
+
+### Profiles — Structural Mappings
+
+Profiles map element names to semantic roles. They persist across sessions:
 
 ```python
 ds_profile_save(
@@ -213,19 +262,20 @@ ds_profile_save(
 
 Next time anyone snaps DirectShell to Excel, your profile loads automatically. You already know the app.
 
-**This is how we build a universal config repository.** Every profile you save helps every LLM that comes after you. Contribute your profiles back to the community.
+**Both systems are collaborative.** Every profile and every learning you save helps every LLM that comes after you. Imagine 1 million users with 1 million programs — and a shared knowledge base. Every mistake one user makes becomes training data for everyone else.
 
 ---
 
-## Known Limitations (Day 1 — February 2026)
+## Known Limitations (February 2026)
 
 - **Single-app scope**: DirectShell attaches to one application at a time. Multi-app workflows require re-snapping.
 - **Chromium activation**: Chrome, Edge, Discord, VS Code, Slack, and other Chromium-based apps need a few seconds to build their accessibility tree after snapping. Be patient on first snap.
-- **`ds_type` character loss**: At high speed, some characters may be dropped. For critical input, use `ds_text` when possible or reduce typing speed.
+- **`ds_type` in Chromium**: The keyboard simulation may produce double characters in some Chromium-based apps. **Always prefer `ds_text`** (ValuePattern) for text input. Only fall back to `ds_type` for apps that reject ValuePattern (chat inputs, terminals).
+- **Canvas-rendered content**: Some web apps render on canvas (e.g., Google Sheets cells). The a11y tree shows 0 elements for these. Use `ds_type` with keyboard navigation (Tab, Enter) instead.
 - **Accessibility quality varies**: The tree is only as good as the app's accessibility implementation. Major enterprise software is comprehensive. Smaller apps may have unnamed buttons or missing values.
 - **Windows only (for now)**: macOS (NSAccessibility) and Linux (AT-SPI2) have equivalent frameworks. Cross-platform support is planned.
 
-These are Day 1 limitations. The architecture is sound. The bugs will be fixed.
+The architecture is sound. The learnings system means every limitation you encounter and document makes every future session smarter.
 
 ---
 

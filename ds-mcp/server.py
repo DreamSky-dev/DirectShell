@@ -34,6 +34,9 @@ import json
 import os
 import sys
 import time
+import re
+import socket
+import requests
 from pathlib import Path
 from typing import Optional
 
@@ -121,6 +124,20 @@ def _read_active() -> dict:
         "a11y": lines[1] if len(lines) > 1 else "",
         "snap": lines[2] if len(lines) > 2 else "",
     }
+
+
+def _get_snapped_app() -> str:
+    """Return the currently snapped app name, or empty string."""
+    status = _read_active()
+    return status["app"] if status["snapped"] else ""
+
+
+def _learning_hint() -> str:
+    """Return a short reminder to save learnings after actions."""
+    app = _get_snapped_app()
+    if not app:
+        return ""
+    return f"Tip: Save discoveries with ds_learn('{app}', '<context>', append='...')"
 
 
 def _get_db_path(app: Optional[str] = None) -> Path:
@@ -559,7 +576,7 @@ def ds_click(element_name: str, app: Optional[str] = None) -> dict:
         Confirmation with the action ID.
     """
     action_id = _inject_action("click", target=element_name, app=app)
-    return {"action": "click", "target": element_name, "id": action_id, "status": "queued"}
+    return {"action": "click", "target": element_name, "id": action_id, "status": "queued", "learn": _learning_hint()}
 
 
 @mcp.tool()
@@ -601,8 +618,10 @@ def ds_type(text: str, app: Optional[str] = None) -> dict:
     Returns:
         Confirmation with the action ID.
     """
+    # Convert escape sequences to actual control chars (MCP sends literal \\t \\n)
+    text = text.replace("\\t", "\t").replace("\\n", "\n").replace("\\r", "\r")
     action_id = _inject_action("type", text=text, app=app)
-    return {"action": "type", "text": text, "id": action_id, "status": "queued"}
+    return {"action": "type", "text": text, "id": action_id, "status": "queued", "learn": _learning_hint()}
 
 
 @mcp.tool()
@@ -633,7 +652,7 @@ def ds_key(combo: str, app: Optional[str] = None) -> dict:
         Confirmation with the action ID.
     """
     action_id = _inject_action("key", text=combo, app=app)
-    return {"action": "key", "combo": combo, "id": action_id, "status": "queued"}
+    return {"action": "key", "combo": combo, "id": action_id, "status": "queued", "learn": _learning_hint()}
 
 
 @mcp.tool()
@@ -701,6 +720,9 @@ def ds_batch(actions: list[dict], app: Optional[str] = None) -> list[dict]:
             "id": action_id,
             "status": "queued",
         })
+    hint = _learning_hint()
+    if results and hint:
+        results[-1]["learn"] = hint
     return results
 
 
@@ -792,6 +814,430 @@ def ds_profile_get(app: str) -> dict:
     if app not in profiles:
         return {"app": app, "status": "no_profile", "hint": "Use ds_profile_save to create one."}
     return {"app": app, **profiles[app]}
+
+
+# ---------------------------------------------------------------------------
+# VISION TRANSLATOR — Gemini-powered screen understanding
+# ---------------------------------------------------------------------------
+
+_TRANSLATOR_MODEL = "google/gemini-2.5-flash-lite-preview-09-2025"
+_TRANSLATOR_PROMPT = """UI translator. 3 data sources: a11y (text content), snap (operable elements), CDP DOM (browser interactive elements).
+Merge ALL sources. Output 3 sections separated by --- on its own line:
+
+SCREEN
+2-3 sentences. What app/page/state.
+
+---
+
+TOOLS
+One line per action. Format: action|"exact_element_name"|description
+- action = click or type or select
+- exact_element_name = EXACT from snap or CDP label
+- Skip decorative, only actionable elements
+
+---
+
+DATA
+Visible values: prices, numbers, counts, status.
+One line per value. Plain text. If nothing interesting, write: none"""
+
+# In-memory store for active tools
+_active_view = {"screen": "", "tools": [], "data": "", "raw_tools": []}
+
+
+def _get_openrouter_key() -> str:
+    """Load OpenRouter API key. Checks: env var → .env next to server.py → repo root .env"""
+    import os
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if key:
+        return key
+    # Search for .env files
+    for candidate in [
+        Path(__file__).resolve().parent / ".env",         # ds-mcp/.env
+        Path(__file__).resolve().parent.parent / ".env",   # repo root/.env
+    ]:
+        if candidate.exists():
+            with open(candidate, "r") as f:
+                for line in f:
+                    if line.startswith("OPENROUTER_API_KEY="):
+                        return line.strip().split("=", 1)[1]
+    raise RuntimeError(
+        "OPENROUTER_API_KEY not found. Set it as an environment variable or create a .env file "
+        "with OPENROUTER_API_KEY=your_key_here. Get a key at https://openrouter.ai/keys"
+    )
+
+
+def _get_cdp_elements() -> str:
+    """Extract interactive elements from the active browser tab via CDP (port 9222).
+    Returns a compact text listing of inputs, buttons, links, etc. or empty string if CDP unavailable."""
+    try:
+        # Quick check if CDP is up
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.3)
+        result = s.connect_ex(("127.0.0.1", 9222))
+        s.close()
+        if result != 0:
+            return ""
+
+        # Get active tab (first visible page)
+        tabs = requests.get("http://127.0.0.1:9222/json/list", timeout=2).json()
+        page_tab = None
+        for t in tabs:
+            if t.get("type") == "page" and "webSocketDebuggerUrl" in t:
+                page_tab = t
+                break  # First page tab = active
+        if not page_tab:
+            return ""
+
+        ws_url = page_tab["webSocketDebuggerUrl"]
+        tab_title = page_tab.get("title", "")
+        tab_url = page_tab.get("url", "")
+
+        # Sync websocket via raw socket (no async dependency needed)
+        import websocket  # websocket-client (sync)
+        ws = websocket.create_connection(ws_url, timeout=5)
+
+        js = r'''(() => {
+            const results = [];
+            const seen = new Set();
+            const selectors = 'input, textarea, select, button, [role="button"], [role="textbox"], [role="menuitem"], [role="link"], [role="checkbox"], [role="radio"], [role="combobox"], [role="searchbox"], [role="tab"], [role="gridcell"], [contenteditable="true"], a[href]';
+            document.querySelectorAll(selectors).forEach(el => {
+                if (el.offsetParent === null && el.type !== 'hidden') return; // skip invisible
+                const tag = el.tagName.toLowerCase();
+                const role = el.getAttribute('role') || '';
+                const ariaLabel = el.getAttribute('aria-label') || '';
+                const name = el.getAttribute('name') || '';
+                const id = el.id || '';
+                const type = el.type || '';
+                const placeholder = el.placeholder || '';
+                const text = (el.textContent || '').trim().substring(0, 60);
+                const label = ariaLabel || placeholder || text || name || id;
+                const key = `${tag}|${role}|${label}`;
+                if (seen.has(key) || !label) return;
+                seen.add(key);
+                let action = 'click';
+                if (['input','textarea'].includes(tag) || role === 'textbox' || role === 'searchbox' || role === 'combobox' || el.contentEditable === 'true') action = 'type';
+                if (tag === 'select') action = 'select';
+                results.push(`${action}|${label}`);
+            });
+            return results.slice(0, 80).join('\n');
+        })()'''
+
+        ws.send(json.dumps({
+            "id": 1,
+            "method": "Runtime.evaluate",
+            "params": {"expression": js, "returnByValue": True}
+        }))
+        resp = json.loads(ws.recv())
+        ws.close()
+
+        value = resp.get("result", {}).get("result", {}).get("value", "")
+        if not value:
+            return ""
+
+        return f"[CDP: {tab_title} — {tab_url}]\n{value}"
+    except Exception:
+        return ""
+
+
+def _filter_a11y(raw: str) -> str:
+    """Extract ONLY readable text content from a11y — no coordinates, no chrome."""
+    lines = []
+    in_content = False
+    for line in raw.splitlines():
+        # Keep header (window title)
+        if line.startswith("# Window:"):
+            lines.append(line)
+            continue
+        # Keep Focus section (1 line)
+        if line.startswith("## Focus"):
+            in_content = False
+            continue
+        if line.startswith("[interact]"):
+            lines.append(f"Focus: {line.split('\"')[1] if '\"' in line else line}")
+            continue
+        # Keep Input Targets — only name + value, strip coords
+        if line.startswith("## Input Targets"):
+            in_content = True
+            continue
+        if in_content and line.startswith("["):
+            # Extract label from quotes
+            if '"' in line:
+                label = line.split('"')[1]
+                if label in ("Laden…", "Laden..."):
+                    continue  # skip loading placeholders
+                lines.append(f"  input: {label}")
+            continue
+        if in_content and line.strip().startswith("value:"):
+            lines.append(f"    {line.strip()}")
+            continue
+        # Content section — keep all text
+        if line.startswith("## Content"):
+            in_content = False
+            lines.append("## Content")
+            continue
+        if line.startswith("##"):
+            in_content = False
+            continue
+        # Everything after ## Content is pure text
+        if lines and lines[-1] == "## Content" or (lines and not line.startswith("[") and not line.startswith("  ") and line.strip()):
+            if line.strip() and not line.startswith("#"):
+                lines.append(line.strip())
+    return "\n".join(lines)
+
+
+def _filter_snap(raw: str) -> str:
+    """Extract ONLY page-relevant operable elements — no browser chrome."""
+    # Browser chrome patterns to skip
+    skip_patterns = (
+        "Laden…", "Laden...", "Tab schließen", "Tabs suchen",
+        "Minimieren", "Maximieren", "Wiederherstellen", "Schließen",
+        "Opera-Menü", "GX Corner", "Zum Ausklappen",
+        "Pinboards", "Momentaufnahme", "An Mein Flow",
+        "Zu Lesezeichen", "Erweiterungen", "Opera Account",
+        "Downloads", "Frage AI", "Einfache Einrichtung",
+        "GX Cleaner", "GX Control", "Shaders", "Mods",
+        "Twitch", "WhatsApp", "Player", "Verlauf",
+        "Einstellungen", "Einrichtung der Seitenleiste",
+        "Neuer Tab", "Adressleiste", "Menü „Erweiterungen"",
+        "uBlock", "Zurück", "Stopp", "Vor",
+        "Seite mit „Geschützt"", "Zoomanzeige",
+    )
+    # Tab patterns: known browser tabs (Gmail, YouTube, etc.)
+    tab_skip = (" - Gmail", "- YouTube", "| YouTube", "Hacker News",
+                "DEV Community", "Stack Overflow", "Reddit",
+                "Wikipedia", "Google Docs", "Google Drive")
+
+    lines = []
+    for line in raw.splitlines():
+        if line.startswith("#"):
+            if line.startswith("# Window:"):
+                lines.append(line)
+            continue
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Extract element name
+        name = ""
+        if '"' in stripped:
+            parts = stripped.split('"')
+            if len(parts) >= 2:
+                name = parts[1]
+        if not name:
+            continue
+        # Skip browser chrome
+        if any(p in name for p in skip_patterns):
+            continue
+        # Skip browser tabs (other open pages)
+        if any(p in name for p in tab_skip):
+            continue
+        # Skip "Laden…" keyboard entries
+        if name == "Laden…":
+            continue
+        lines.append(stripped)
+    return "\n".join(lines)
+
+
+def _call_translator(a11y: str, snap: str) -> str:
+    """Send a11y files (+ optional CDP data) to Gemini and get translated view."""
+    key = _get_openrouter_key()
+
+    # Pre-filter: send only what Gemini needs
+    filtered_a11y = _filter_a11y(a11y)
+    filtered_snap = _filter_snap(snap)
+
+    prompt = _TRANSLATOR_PROMPT + f"\n\n--- SCREEN CONTENT (.a11y) ---\n\n{filtered_a11y}\n\n--- OPERABLE ELEMENTS (.a11y.snap) ---\n\n{filtered_snap}"
+
+    # Enrich with CDP DOM elements if browser is running with DevTools
+    cdp_data = _get_cdp_elements()
+    if cdp_data:
+        prompt += f"\n\n--- CDP DOM ELEMENTS (browser page) ---\n\n{cdp_data}"
+
+    resp = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        json={
+            "model": _TRANSLATOR_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 2000,
+            "temperature": 0.1,
+        },
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"OpenRouter error {resp.status_code}: {resp.text[:200]}")
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+def _parse_translator_response(text: str) -> dict:
+    """Parse the translator's plain text response into structured data."""
+    sections = re.split(r'\n---\n', text, maxsplit=2)
+
+    screen = sections[0].strip() if len(sections) > 0 else ""
+    # Remove "SCREEN" header if present
+    screen = re.sub(r'^SCREEN\s*\n', '', screen).strip()
+
+    tools_raw = sections[1].strip() if len(sections) > 1 else ""
+    tools_raw = re.sub(r'^TOOLS\s*\n', '', tools_raw).strip()
+
+    data = sections[2].strip() if len(sections) > 2 else ""
+    data = re.sub(r'^DATA\s*\n', '', data).strip()
+
+    # Parse tools: action|"element_name"|description
+    tools = []
+    for line in tools_raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = line.split('|', 2)
+        if len(parts) >= 3:
+            action = parts[0].strip()
+            element = parts[1].strip().strip('"')
+            desc = parts[2].strip()
+            tools.append({"action": action, "element": element, "description": desc})
+
+    return {"screen": screen, "tools": tools, "data": data}
+
+
+@mcp.tool()
+def ds_update_view(app: Optional[str] = None) -> dict:
+    """Update the agent's understanding of the current screen.
+
+    Reads the accessibility tree and operable elements, sends them to
+    a fast LLM (Gemini Flash Lite) which translates them into:
+
+    1. SCREEN — What a human would see right now (2-3 sentences)
+    2. TOOLS — Every actionable element with human-readable descriptions
+    3. DATA — Interesting values visible on the page
+
+    Call this after navigating to a new page or when you need to
+    understand what's on screen. The returned tools show you exactly
+    what you can do and which element names to use.
+
+    Args:
+        app: Optional app name. If omitted, uses the currently snapped app.
+
+    Returns:
+        screen: Human description of what's visible
+        tools: List of available actions with element names and descriptions
+        data: Extracted values from the page
+    """
+    global _active_view
+
+    a11y = _read_file(".a11y", app)
+    snap = _read_file(".a11y.snap", app)
+
+    raw_response = _call_translator(a11y, snap)
+    parsed = _parse_translator_response(raw_response)
+
+    _active_view = {
+        "screen": parsed["screen"],
+        "tools": parsed["tools"],
+        "data": parsed["data"],
+    }
+
+    # Format tools for display
+    tool_lines = []
+    for i, t in enumerate(parsed["tools"], 1):
+        tool_lines.append(f"  [{i}] {t['action']}|{t['element']}| {t['description']}")
+
+    # Find available learnings for this app
+    app_name = app or _get_snapped_app()
+    learnings_dir = PROFILES_DIR / "learnings"
+    available_learnings = []
+    if learnings_dir.is_dir() and app_name:
+        prefix = app_name.lower() + "_"
+        for f in sorted(learnings_dir.glob(f"{prefix}*.md")):
+            context = f.stem[len(prefix):]  # e.g. "sheets" from "opera_sheets.md"
+            available_learnings.append(context)
+
+    result = {
+        "screen": parsed["screen"],
+        "tools": "\n".join(tool_lines),
+        "tool_count": len(parsed["tools"]),
+        "data": parsed["data"],
+    }
+    if available_learnings:
+        result["learnings"] = available_learnings
+        result["learnings_hint"] = f"Read learnings BEFORE acting: ds_learn('{app_name}', '<context>')"
+    else:
+        result["learnings"] = []
+        result["learnings_hint"] = (
+            f"No learnings yet for '{app_name}'. After completing actions, "
+            f"save what you learned: ds_learn('{app_name}', '<context>', append='your insight here')"
+        )
+
+    return result
+
+
+@mcp.tool()
+def ds_learn(app: str, context: str, append: Optional[str] = None) -> dict:
+    """Read or append to a learning file for a specific app+context.
+
+    Learning files store tips, quirks, and best practices discovered while
+    using an application. They persist across sessions and make you smarter.
+
+    Args:
+        app: Application name (e.g. "opera", "notepad", "discord")
+        context: Action context (e.g. "sheets", "gmail", "general")
+        append: If provided, append this text to the learning file. If omitted, read it.
+
+    Returns:
+        content: The learning file contents (after read or append)
+    """
+    learnings_dir = PROFILES_DIR / "learnings"
+    learnings_dir.mkdir(parents=True, exist_ok=True)
+    filepath = learnings_dir / f"{app.lower()}_{context.lower()}.md"
+
+    if append:
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write(f"\n{append}\n")
+
+    if filepath.exists():
+        content = filepath.read_text(encoding="utf-8")
+    else:
+        content = f"No learnings yet for {app}/{context}"
+
+    return {"app": app, "context": context, "file": str(filepath), "content": content}
+
+
+@mcp.tool()
+def ds_act(tool_number: int, text: Optional[str] = None, app: Optional[str] = None) -> dict:
+    """Execute an action from the current tool list.
+
+    After calling ds_update_view(), use the tool number to execute an action.
+    For 'type' actions, provide the text parameter.
+    For 'click' actions, just the tool number is enough.
+
+    Args:
+        tool_number: The tool number from ds_update_view output (1-based).
+        text: Text to type (required for 'type' actions, ignored for 'click').
+        app: Optional app name. If omitted, uses the currently snapped app.
+
+    Returns:
+        Confirmation with action details.
+    """
+    if not _active_view["tools"]:
+        raise ValueError("No active tools. Call ds_update_view() first.")
+
+    idx = tool_number - 1
+    if idx < 0 or idx >= len(_active_view["tools"]):
+        raise ValueError(f"Tool {tool_number} not found. Available: 1-{len(_active_view['tools'])}")
+
+    tool = _active_view["tools"][idx]
+
+    if tool["action"] == "type":
+        if not text:
+            raise ValueError(f"Tool {tool_number} is a type action — provide text parameter.")
+        action_id = _inject_action("type", text=text, target=tool["element"], app=app)
+        return {"action": "type", "element": tool["element"], "text": text, "id": action_id, "description": tool["description"]}
+    elif tool["action"] == "click":
+        action_id = _inject_action("click", target=tool["element"], app=app)
+        return {"action": "click", "element": tool["element"], "id": action_id, "description": tool["description"]}
+    else:
+        # Fallback — treat as click
+        action_id = _inject_action("click", target=tool["element"], app=app)
+        return {"action": tool["action"], "element": tool["element"], "id": action_id, "description": tool["description"]}
 
 
 # ---------------------------------------------------------------------------

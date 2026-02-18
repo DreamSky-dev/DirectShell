@@ -86,7 +86,7 @@ Technisch kombiniert es zum ersten Mal:
 ### Stack-Optionen
 | Option | Pro | Contra |
 |--------|-----|--------|
-| **Rust + Tauri** | Bekannter Stack (Veritas), native Performance, klein | Tauri's Window-API evtl. limitiert fuer Low-Level Hooks |
+| **Rust + Tauri** | Bekannter Stack, native Performance, klein | Tauri's Window-API evtl. limitiert fuer Low-Level Hooks |
 | **Rust pur (winapi crate)** | Maximale Kontrolle, kein Framework-Overhead | Mehr Boilerplate, kein UI-Framework |
 | **C# / WPF** | Bester nativer Windows-Support fuer transparente Fenster | Anderer Stack als bestehende Projekte |
 
@@ -156,7 +156,7 @@ Limit entfernt → 11.454 Elemente → ALLES da.
 
 ```sql
 SELECT name FROM elements WHERE role='Text' AND length(name)>10 ORDER BY y DESC LIMIT 1
-SELECT name FROM elements WHERE name LIKE '%lars%nda%'
+SELECT name FROM elements WHERE name LIKE '%meeting%tomorrow%'
 SELECT name FROM elements WHERE role='Button' AND offscreen=0
 ```
 
@@ -177,7 +177,7 @@ Der schnellste Test — 211 Elemente in unter 15 Millisekunden.
 |--------|------|
 | Elemente | 398 |
 | Dump-Zeit | ~550ms |
-| Sichtbar | Repo-Name (server-new), Branch (main), 3912 geaenderte Dateien, individuelle File-Status |
+| Sichtbar | Repo-Name, Branch (main), 3912 geaenderte Dateien, individuelle File-Status |
 
 **Erkenntnis:** Mid-Stream Reads liefern exakt `STREAM_BATCH` (200) Elemente wenn man
 zwischen erstem und finalem COMMIT liest. Loesung: 500ms warten oder Retry-Loop.
@@ -399,13 +399,13 @@ Vendor Lock-in entmachtet. Jede Software wird zur Marionette des Users.
 
 ## Strategische Bedeutung
 
-DirectShell loest Martins wiederkehrendes Problem:
+DirectShell loest ein wiederkehrendes Problem:
 > "Wie komme ich zwischen User-Input und eine geschlossene Desktop-App?"
 
 - Browser extensions were always a compromise → DirectShell does it natively for ANY app
-- A.D.A. koennte DirectShell als Overlay nutzen → visuelles Feedback direkt auf der App
+- AI agents koennte DirectShell als Overlay nutzen → visuelles Feedback direkt auf der App
 - Universell einsetzbar → groesste Zielgruppe aller Projekte
-- **DirectShell ist das Fundament fuer ALLE anderen Projekte** — der universelle Connector
+- **DirectShell ist das Fundament** — der universelle Connector
 
 ---
 

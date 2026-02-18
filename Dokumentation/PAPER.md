@@ -323,4 +323,4 @@ The technology described in this paper was built in a single session by one deve
 
 *DirectShell v0.2.0*
 *Martin Gehrken, 2026*
-*Contact: thelastrag.de*
+*Contact: github.com/IamLumae*
