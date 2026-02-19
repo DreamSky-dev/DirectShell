@@ -112,6 +112,8 @@ static DYN_TOP_H: AtomicI32 = AtomicI32::new(DEFAULT_TOP_H);
 static START_TIME: OnceLock<Instant> = OnceLock::new();
 static DS_HWND: AtomicIsize = AtomicIsize::new(0);           // Daemon: eigenes Fenster-Handle
 static DAEMON_SNAP: AtomicBool = AtomicBool::new(false);     // Daemon: skip CDP popup
+static LAST_CLICK_X: AtomicI32 = AtomicI32::new(-1);        // Auto-persist: last click X (absolute screen)
+static LAST_CLICK_Y: AtomicI32 = AtomicI32::new(-1);        // Auto-persist: last click Y (absolute screen)
 
 fn tgt() -> HWND { HWND(TARGET_HW.load(SeqCst) as *mut _) }
 fn snapped() -> bool { IS_SNAPPED.load(SeqCst) }
@@ -395,6 +397,8 @@ fn init_db(db_path: &str) -> Option<Connection> {
     // Migrations for pre-existing DBs
     let _ = conn.execute_batch("ALTER TABLE inject ADD COLUMN target TEXT DEFAULT '';");
     let _ = conn.execute_batch("ALTER TABLE inject ADD COLUMN action TEXT DEFAULT 'text';");
+    // Clear stale actions from previous session
+    let _ = conn.execute("DELETE FROM inject WHERE done=0", []);
     log("init_db: OK");
     Some(conn)
 }
@@ -1353,7 +1357,6 @@ fn is_extended_key(vk: VIRTUAL_KEY) -> bool {
 }
 
 /// Send a single VK key down+up via SendInput
-#[allow(dead_code)]
 unsafe fn send_vk(vk: VIRTUAL_KEY) {
     let ext = if is_extended_key(vk) { KEYEVENTF_EXTENDEDKEY } else { KEYBD_EVENT_FLAGS(0) };
     let inputs = [
@@ -1382,7 +1385,6 @@ unsafe fn send_vk(vk: VIRTUAL_KEY) {
 }
 
 /// Send a VK modifier key DOWN only
-#[allow(dead_code)]
 unsafe fn send_vk_down(vk: VIRTUAL_KEY) {
     let ext = if is_extended_key(vk) { KEYEVENTF_EXTENDEDKEY } else { KEYBD_EVENT_FLAGS(0) };
     let input = [INPUT {
@@ -1399,7 +1401,6 @@ unsafe fn send_vk_down(vk: VIRTUAL_KEY) {
 }
 
 /// Send a VK modifier key UP only
-#[allow(dead_code)]
 unsafe fn send_vk_up(vk: VIRTUAL_KEY) {
     let ext = if is_extended_key(vk) { KEYEVENTF_EXTENDEDKEY } else { KEYBD_EVENT_FLAGS(0) };
     let input = [INPUT {
@@ -1418,7 +1419,6 @@ unsafe fn send_vk_up(vk: VIRTUAL_KEY) {
 /// Parse and send a key combo like "ctrl+shift+a" or "enter" or "f5"
 /// Supports any combination of modifiers + one main key.
 /// Uses SendInput (global) — used by keyboard hook where target is already focused.
-#[allow(dead_code)]
 unsafe fn send_key_combo(combo: &str) {
     let parts: Vec<&str> = combo.split('+').map(|s| s.trim()).collect();
     let mut modifiers: Vec<VIRTUAL_KEY> = Vec::new();
@@ -1447,119 +1447,6 @@ unsafe fn send_key_combo(combo: &str) {
     for &m in modifiers.iter().rev() { send_vk_up(m); }
 
     log(&format!("key: sent '{}'", combo));
-}
-
-// ── Non-Blocking Input (PostMessage-based, window-independent) ──
-
-/// Build the lParam for WM_KEYDOWN/WM_KEYUP messages.
-unsafe fn make_key_lparam(vk: VIRTUAL_KEY, extended: bool, key_up: bool) -> LPARAM {
-    let scan = MapVirtualKeyW(vk.0 as u32, MAP_VIRTUAL_KEY_TYPE(0) /*MAPVK_VK_TO_VSC*/) as i32;
-    let mut lp: i32 = 1; // repeat count = 1
-    lp |= (scan & 0xFF) << 16; // scan code bits 16-23
-    if extended { lp |= 1 << 24; } // extended key flag
-    if key_up {
-        lp |= 1 << 30; // previous key state = was down
-        lp |= 1 << 31; // transition state = being released
-    }
-    LPARAM(lp as isize)
-}
-
-/// Find the child HWND that should receive keyboard input inside a window.
-/// Find the deepest child window suitable for keyboard input.
-/// For Chromium browsers, finds Chrome_RenderWidgetHostHWND.
-/// Falls back to AttachThreadInput focus discovery, then target itself.
-unsafe fn find_input_hwnd(target_hwnd: HWND) -> HWND {
-    // Strategy 1: Walk child windows looking for Chromium render widget
-    use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
-    static FOUND: AtomicIsize = AtomicIsize::new(0);
-    FOUND.store(0, Relaxed);
-
-    unsafe extern "system" fn enum_children(hwnd: HWND, _: LPARAM) -> BOOL {
-        let mut cls = [0u16; 128];
-        let len = GetClassNameW(hwnd, &mut cls);
-        let name = String::from_utf16_lossy(&cls[..len as usize]);
-        // Chromium render widget — this is where keyboard input goes
-        if name.contains("Chrome_RenderWidgetHostHWND")
-            || name.contains("MozillaWindowClass")
-            || name.contains("Internet Explorer_Server") {
-            FOUND.store(hwnd.0 as isize, Relaxed);
-            return FALSE; // stop enumeration
-        }
-        TRUE // continue
-    }
-
-    let _ = EnumChildWindows(target_hwnd, Some(enum_children), LPARAM(0));
-    let found = FOUND.load(Relaxed);
-    if found != 0 {
-        return HWND(found as *mut _);
-    }
-
-    // Strategy 2: AttachThreadInput to discover focused control
-    let our_tid = GetCurrentThreadId();
-    let target_tid = GetWindowThreadProcessId(target_hwnd, None);
-    if our_tid == target_tid {
-        let focus = GetFocus();
-        if !focus.0.is_null() { return focus; }
-        return target_hwnd;
-    }
-    let _ = AttachThreadInput(our_tid, target_tid, TRUE);
-    let focus = GetFocus();
-    let _ = AttachThreadInput(our_tid, target_tid, FALSE);
-    if !focus.0.is_null() { focus } else { target_hwnd }
-}
-
-/// Post a single Unicode character to the target window (non-blocking, no focus steal).
-unsafe fn post_char(target_hwnd: HWND, ch: char) {
-    let hwnd = find_input_hwnd(target_hwnd);
-    let _ = PostMessageW(hwnd, WM_CHAR, WPARAM(ch as usize), LPARAM(0));
-}
-
-/// Post a VK key down+up to the target window (non-blocking, no focus steal).
-unsafe fn post_vk(target_hwnd: HWND, vk: VIRTUAL_KEY) {
-    let hwnd = find_input_hwnd(target_hwnd);
-    let ext = is_extended_key(vk);
-    let _ = PostMessageW(hwnd, WM_KEYDOWN, WPARAM(vk.0 as usize), make_key_lparam(vk, ext, false));
-    let _ = PostMessageW(hwnd, WM_KEYUP, WPARAM(vk.0 as usize), make_key_lparam(vk, ext, true));
-}
-
-/// Post a VK modifier key DOWN to the target window.
-unsafe fn post_vk_down(target_hwnd: HWND, vk: VIRTUAL_KEY) {
-    let hwnd = find_input_hwnd(target_hwnd);
-    let ext = is_extended_key(vk);
-    let _ = PostMessageW(hwnd, WM_KEYDOWN, WPARAM(vk.0 as usize), make_key_lparam(vk, ext, false));
-}
-
-/// Post a VK modifier key UP to the target window.
-unsafe fn post_vk_up(target_hwnd: HWND, vk: VIRTUAL_KEY) {
-    let hwnd = find_input_hwnd(target_hwnd);
-    let ext = is_extended_key(vk);
-    let _ = PostMessageW(hwnd, WM_KEYUP, WPARAM(vk.0 as usize), make_key_lparam(vk, ext, true));
-}
-
-/// Parse and post a key combo to the target window (non-blocking, no focus steal).
-unsafe fn post_key_combo(target_hwnd: HWND, combo: &str) {
-    let parts: Vec<&str> = combo.split('+').map(|s| s.trim()).collect();
-    let mut modifiers: Vec<VIRTUAL_KEY> = Vec::new();
-    let mut main_key: Option<VIRTUAL_KEY> = None;
-
-    for part in &parts {
-        if let Some(vk) = key_to_vk(part) {
-            if matches!(vk, VK_CONTROL | VK_MENU | VK_SHIFT | VK_LWIN | VK_RWIN) {
-                modifiers.push(vk);
-            } else {
-                main_key = Some(vk);
-            }
-        } else {
-            log(&format!("postkey: unknown key '{}'", part));
-            return;
-        }
-    }
-
-    for &m in &modifiers { post_vk_down(target_hwnd, m); }
-    if let Some(mk) = main_key { post_vk(target_hwnd, mk); }
-    for &m in modifiers.iter().rev() { post_vk_up(target_hwnd, m); }
-
-    log(&format!("postkey: sent '{}'", combo));
 }
 
 /// Click on a UI element by name using UIA. Finds element, gets center, sends mouse click.
@@ -1591,38 +1478,12 @@ unsafe fn click_element(target_hwnd: HWND, element_name: &str) -> bool {
         }
     };
 
-    // Strategy 1: UIA InvokePattern — no mouse movement, no focus steal
-    if let Ok(pat) = elem.GetCurrentPattern(UIA_InvokePatternId) {
-        if let Ok(ip) = pat.cast::<IUIAutomationInvokePattern>() {
-            if ip.Invoke().is_ok() {
-                log(&format!("click: InvokePattern OK '{}'", element_name));
-                return true;
-            }
-        }
-    }
-
-    // Strategy 2: UIA TogglePattern (checkboxes, toggle buttons)
-    if let Ok(pat) = elem.GetCurrentPattern(UIA_TogglePatternId) {
-        if let Ok(tp) = pat.cast::<IUIAutomationTogglePattern>() {
-            if tp.Toggle().is_ok() {
-                log(&format!("click: TogglePattern OK '{}'", element_name));
-                return true;
-            }
-        }
-    }
-
-    // Strategy 3: UIA SelectionItemPattern (radio buttons, list items)
-    if let Ok(pat) = elem.GetCurrentPattern(UIA_SelectionItemPatternId) {
-        if let Ok(sp) = pat.cast::<IUIAutomationSelectionItemPattern>() {
-            if sp.Select().is_ok() {
-                log(&format!("click: SelectionItemPattern OK '{}'", element_name));
-                return true;
-            }
-        }
-    }
-
-    // Strategy 4: Fallback — SendInput (only if UIA patterns unavailable)
-    log(&format!("click: no UIA pattern, falling back to SendInput '{}'", element_name));
+    // Native mouse click via SendInput — always.
+    // UIA InvokePattern is synchronous cross-process COM → deadlocks Electron apps (Discord).
+    // We only use UIA to FIND the element coordinates, then click with real mouse input.
+    // Bring target to foreground first — SendInput goes to the foreground window.
+    let _ = SetForegroundWindow(target_hwnd);
+    std::thread::sleep(std::time::Duration::from_millis(30));
     let rect = match elem.CurrentBoundingRectangle() {
         Ok(r) => r,
         Err(e) => { log(&format!("click: rect FAIL: {e}")); return false; }
@@ -1656,12 +1517,14 @@ unsafe fn click_element(target_hwnd: HWND, element_name: &str) -> bool {
         },
     ];
     SendInput(&inputs, mem::size_of::<INPUT>() as i32);
-    log(&format!("click: SendInput fallback '{}' @ {},{}", element_name, cx, cy));
+    // Auto-persist: remember last click coordinates for re-focus before type/key
+    LAST_CLICK_X.store(abs_x, SeqCst);
+    LAST_CLICK_Y.store(abs_y, SeqCst);
+    log(&format!("click: SendInput '{}' @ {},{} (persisted)", element_name, cx, cy));
     true
 }
 
 /// Scroll the target window (up/down/left/right)
-#[allow(dead_code)]
 unsafe fn scroll_window(target_hwnd: HWND, direction: &str) {
     let (dx, dy): (i32, i32) = match direction.to_lowercase().as_str() {
         "up"    => (0, 120),    // WHEEL_DELTA = 120
@@ -1771,51 +1634,60 @@ fn process_injections() {
                 match action.as_str() {
                     "text" => inject_text(target, &text, &target_name),
                     "type" => {
-                        // Non-blocking: PostMessage to Chromium render widget
-                        let input_hwnd = find_input_hwnd(target);
-                        log(&format!("type: posting {} chars to hwnd 0x{:X}", text.len(), input_hwnd.0 as usize));
-                        for ch in text.chars() {
+                        // Auto-persist: ALWAYS re-click last known focus before typing
+                        let lx = LAST_CLICK_X.load(SeqCst);
+                        let ly = LAST_CLICK_Y.load(SeqCst);
+                        if lx >= 0 && ly >= 0 {
+                            let _ = SetForegroundWindow(target);
+                            std::thread::sleep(std::time::Duration::from_millis(30));
+                            let refocus = [
+                                INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dx: lx, dy: ly, mouseData: 0, dwFlags: MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN, time: 0, dwExtraInfo: 0 } } },
+                                INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dx: lx, dy: ly, mouseData: 0, dwFlags: MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP, time: 0, dwExtraInfo: 0 } } },
+                            ];
+                            SendInput(&refocus, mem::size_of::<INPUT>() as i32);
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            log(&format!("type: re-focus @ abs({},{})", lx, ly));
+                        }
+                        log(&format!("type: BEGIN SendInput {} chars", text.len()));
+                        let mut aborted = false;
+                        for (i, ch) in text.chars().enumerate() {
+                            // Fail-safe: abort if target lost foreground focus
+                            let fg = GetForegroundWindow();
+                            if fg != target && !target.0.is_null() {
+                                log(&format!("type: ABORT at char[{}] — focus lost (fg=0x{:X} target=0x{:X})", i, fg.0 as usize, target.0 as usize));
+                                aborted = true;
+                                break;
+                            }
                             match ch {
-                                '\t' => post_vk(target, VK_TAB),
-                                '\n' | '\r' => post_vk(target, VK_RETURN),
-                                _ => {
-                                    // Full keyboard sequence: KEYDOWN → CHAR → KEYUP
-                                    let vk = VkKeyScanW(ch as u16);
-                                    let vk_code = (vk & 0xFF) as u16;
-                                    let scan = MapVirtualKeyW(vk_code as u32, MAP_VIRTUAL_KEY_TYPE(0));
-                                    let lp_down = LPARAM(((scan << 16) | 1) as isize);
-                                    let lp_up   = LPARAM(((scan << 16) | 1 | (1 << 30) | (1 << 31)) as isize);
-                                    let _ = PostMessageW(input_hwnd, WM_KEYDOWN, WPARAM(vk_code as usize), lp_down);
-                                    let _ = PostMessageW(input_hwnd, WM_CHAR, WPARAM(ch as usize), lp_down);
-                                    let _ = PostMessageW(input_hwnd, WM_KEYUP, WPARAM(vk_code as usize), lp_up);
-                                },
+                                '\t' => send_vk(VK_TAB),
+                                '\n' | '\r' => send_vk(VK_RETURN),
+                                _ => inject_char(ch),
                             }
                             std::thread::sleep(std::time::Duration::from_millis(5));
                         }
+                        if aborted {
+                            log("type: ABORTED — focus lost mid-typing");
+                        } else {
+                            log(&format!("type: ALL {} CHARS DONE", text.len()));
+                        }
+                        !aborted
+                    },
+                    "key"  => {
+                        // No re-click! Key actions must preserve selection state (ctrl+a → backspace)
+                        // Only bring window to foreground, don't click into it
+                        let _ = SetForegroundWindow(target);
+                        send_key_combo(&text);
                         true
                     },
-                    "key"  => { post_key_combo(target, &text); true },
-                    "click" => click_element(target, &target_name),
+                    "click" => {
+                        log(&format!("click: BEGIN '{}'", target_name));
+                        let r = click_element(target, &target_name);
+                        log(&format!("click: END '{}' result={}", target_name, r));
+                        r
+                    },
                     "scroll" => {
-                        // PostMessage WM_MOUSEWHEEL to target — no cursor move
-                        let (dx, dy): (i32, i32) = match text.to_lowercase().as_str() {
-                            "up"    => (0, 120),
-                            "down"  => (0, -120),
-                            "left"  => (-120, 0),
-                            "right" => (120, 0),
-                            _ => { log(&format!("scroll: unknown '{}'", text)); (0, 0) }
-                        };
-                        if dy != 0 {
-                            let _ = PostMessageW(target, WM_MOUSEWHEEL,
-                                WPARAM((dy as u16 as usize) << 16),
-                                LPARAM(0));
-                        }
-                        if dx != 0 {
-                            let _ = PostMessageW(target, WM_MOUSEHWHEEL,
-                                WPARAM((dx as u16 as usize) << 16),
-                                LPARAM(0));
-                        }
-                        log(&format!("scroll: posted '{}'", text));
+                        // Real scroll via SendInput — same as scroll_window()
+                        scroll_window(target, &text);
                         true
                     },
                     _ => { log(&format!("action: unknown type '{}'", action)); false }
@@ -2678,6 +2550,8 @@ fn main() -> Result<()> {
 
     // Log-Datei bei Start leeren
     let _ = fs::write(LOG_FILE, "");
+    // Clear stale snap state from previous session
+    write_active_status("");
     log("=== DirectShell START ===");
 
     unsafe {

@@ -20,39 +20,56 @@ It works by reading the **Windows Accessibility Tree** — the same structured d
 
 ## How It Works (The 60-Second Version)
 
-1. The human runs `DirectShell.exe`
-2. They drag the overlay window onto any running application — this is called **snapping**
+1. The human runs `DirectShell.exe` — it starts as a **background daemon** tracking all open windows
+2. You call `ds_apps()` to see every application on the system, then `ds_focus("discord")` to snap to one — **no human interaction needed**
 3. DirectShell continuously reads the app's entire UI into a SQLite database (refreshed every 500ms)
-4. You interact through **13 MCP tools** (or through the database files directly)
+4. You interact through **27 MCP tools** (or through the database files directly)
 5. The target application cannot distinguish your actions from human input
+6. **Dual-mode:** Browsers use CDP (Chrome DevTools Protocol) for pixel-perfect DOM access. Native apps use UIA (Windows UI Automation). Routing is automatic.
 
 ---
 
 ## Your Tools
 
-### Overview & Perception
+Every tool has a `prev_ok` parameter — answer `"yes"`, `"no"`, or `"unknown"` to indicate whether your *last* MCP call succeeded. This enables deterministic action logging and learning loops.
+
+### App Switching (Daemon Mode)
+
+| Tool | What It Does | When to Use |
+|------|-------------|-------------|
+| `ds_guide` | Full quick-start guide with workflow | First-time setup, when lost |
+| `ds_apps` | List all open desktop applications | See what's available to control (UIA mode) |
+| `ds_focus` | Switch to a different application by name | Multi-app workflows — snap without human help |
+| `ds_tabs` | List all open browser tabs | See available tabs (CDP/browser mode) |
+| `ds_tab` | Switch to a browser tab by number or name | Switch between browser tabs |
+
+### Perception (Reading the Screen)
 
 | Tool | What It Does | Token Cost | When to Use |
 |------|-------------|:----------:|-------------|
-| `ds_update_view` | **Your primary tool.** Sends a11y tree + operable elements to a fast LLM that returns: what's on screen, every actionable tool, and visible data values. Also lists available learnings. | ~100–300 | **First call. Every time.** After every navigation. After every page change. This IS your eyes. |
+| `ds_update_view` | **Your primary tool.** Returns visible text + numbered tool list. Works in both CDP and UIA mode. | ~100–300 | **First call. Every time.** After every action. This IS your eyes. |
 | `ds_act` | Execute an action by tool number from `ds_update_view` output | ~20 | After `ds_update_view` gives you a numbered tool list — just pick a number |
-| `ds_status` | Shows which app is snapped and file paths | ~20 | Debugging connection issues |
-| `ds_state` | Raw numbered list of operable elements | ~200–500 | Fallback when `ds_update_view` is unavailable |
-| `ds_screen` | Full screen reader view: focus, inputs, all visible content | ~1,000–3,000 | When you need to **read content** (chat messages, documents, articles) |
-| `ds_find` | Search elements by name pattern (SQL LIKE) | ~50–200 | When you're looking for a **specific element** by name |
-| `ds_query` | Run any SQL SELECT against the element database | ~50–200 | **Most powerful tool.** Ask any question about the UI. |
-| `ds_events` | Get only what **changed** since your last check | ~50–200 | **After an action.** See what happened without re-reading everything. |
+| `ds_status` | Shows which native app is snapped | ~20 | Debugging connection issues (UIA mode) |
+| `ds_state` | Raw numbered list of operable elements (UIA) | ~200–500 | Fallback when `ds_update_view` is unavailable |
+| `ds_screen` | Viewport-visible text only — no tools list | ~1,000–3,000 | When you need to **read content** (chat messages, documents, articles) |
+| `ds_print` | **Full page** text — not just viewport (CDP only) | ~2,000–10,000 | Read an entire article, docs page, or long content |
+| `ds_elements` | Interactive elements with automation IDs (UIA) | ~200–500 | Debugging element names and positions |
+| `ds_find` | Search elements by name pattern (SQL LIKE, UIA) | ~50–200 | When you're looking for a **specific element** by name |
+| `ds_query` | Run any SQL SELECT against the element database (UIA) | ~50–200 | **Most powerful tool.** Ask any question about the UI. |
+| `ds_events` | Get only what **changed** since your last check (UIA) | ~50–200 | **After an action.** See what happened without re-reading everything. |
 
 ### Action (Controlling the App)
 
 | Tool | What It Does | When to Use |
 |------|-------------|-------------|
 | `ds_click` | Click an element by name | Buttons, links, checkboxes, tabs |
-| `ds_text` | Set text instantly via UIA ValuePattern | Form fields, address bars, search boxes (fast path) |
-| `ds_type` | Type character-by-character via keyboard simulation | Chat inputs, terminals, fields that reject `ds_text` |
+| `ds_text` | Set text in a named input field. **PREFERRED.** | Form fields, address bars, search boxes (fast path) |
+| `ds_type` | Type character-by-character into the focused element | Chat inputs, terminals, fields that reject `ds_text` |
 | `ds_key` | Send keyboard shortcuts | `ctrl+s`, `enter`, `tab`, `ctrl+a`, `pagedown`, navigation |
 | `ds_scroll` | Scroll in a direction | Fine-grained scrolling inside panels |
 | `ds_batch` | Execute multiple actions in sequence | Multi-step workflows (click, type, tab, type, click) |
+| `ds_navigate` | Navigate browser to a URL (CDP only) | Open a webpage directly |
+| `ds_wait` | Wait for browser page to finish loading (CDP only) | After `ds_navigate` or clicking a link |
 
 ### Learning (Organic Memory)
 
@@ -67,32 +84,41 @@ It works by reading the **Windows Accessibility Tree** — the same structured d
 
 ## Your Workflow (Step by Step)
 
+### Step 0: Pick Your App
+
+```
+→ ds_apps()           # See all open applications
+→ ds_focus("discord") # Snap to Discord — no human needed
+```
+
+Or for browsers:
+```
+→ ds_tabs()           # See all browser tabs
+→ ds_tab("gmail")     # Switch to a tab by name
+```
+
+**You do NOT need to ask the user to snap.** DirectShell runs as a background daemon that tracks all open windows. Just `ds_apps()` → `ds_focus()` → work.
+
 ### Step 1: See the Screen
 
 ```
 → ds_update_view()
 ```
 
-**This is your primary tool. Call it first. Call it often.** It returns three things:
+**This is your primary tool. Call it first. Call it often.** It returns two sections:
 
-1. **SCREEN** — A 2-3 sentence description of what a human would see right now
-2. **TOOLS** — A numbered list of every actionable element (buttons, fields, links)
-3. **DATA** — Interesting values visible on the page (prices, counts, names)
-
-It also tells you if **learnings** exist for this app — read them before acting.
+1. **VISIBLE TEXT** — What a human would see in the viewport right now
+2. **NUMBERED TOOLS** — Every actionable element, e.g. `[1] click|Submit`, `[2] type|Search`
 
 Example response:
 ```
-screen: "Google Sheets spreadsheet with 3 columns (Name, Price, Category) and 12 rows of product data."
-tools:
-  [1] click|File| Open the File menu
-  [2] click|Edit| Open the Edit menu
-  [3] type|Name Box| Enter a cell reference (e.g. A1)
-  [4] type|Formula Bar| Enter a formula or value
-  [5] click|Sheet1| Switch to Sheet1 tab
-tool_count: 5
-learnings: ["sheets"]
-learnings_hint: "Read learnings BEFORE acting: ds_learn('opera', 'sheets')"
+Google Sheets spreadsheet with 3 columns and 12 rows of data.
+---
+[1] click|File
+[2] click|Edit
+[3] type|Name Box
+[4] type|Formula Bar
+[5] click|Sheet1
 ```
 
 ### Step 2: Check Learnings (If Available)
@@ -101,7 +127,7 @@ learnings_hint: "Read learnings BEFORE acting: ds_learn('opera', 'sheets')"
 → ds_learn("opera", "sheets")
 ```
 
-If `ds_update_view` listed available learnings, **read them before doing anything**. They contain tips and quirks discovered in previous sessions — things like "Tab moves to next cell, Enter moves to next row" or "Pad title rows with tabs to avoid column misalignment."
+Learnings contain tips and quirks from previous sessions — "Tab moves to next cell" or "Must use ds_type for chat input."
 
 ### Step 3: Act
 
@@ -130,26 +156,28 @@ Two ways to execute actions:
 
 ### Step 5: Save What You Learned
 
-When you discover something useful — a quirk, a workaround, a best practice — **save it**:
-
 ```
-→ ds_learn("opera", "sheets", append="Tab = next cell, Enter = next row. Don't use Enter in empty rows.")
-→ ds_learn("notepad", "general", append="ds_text works perfectly. No need for ds_type.")
+→ ds_learn("opera", "sheets", append="Tab = next cell, Enter = next row.")
 → ds_learn("discord", "chat", append="Must use ds_type for chat input, ds_text is rejected.")
 ```
 
-Next time any LLM opens the same app, these learnings load automatically. **Every mistake you save prevents the same mistake for everyone who comes after you.**
+Next time any LLM opens the same app, these learnings load automatically.
 
 ---
 
 ## Critical Rules
 
-### 1. `ds_text` vs `ds_type` — Know the Difference
+### 1. `ds_text` vs `ds_type` vs `ds_key` — Know the Difference
 
-- **`ds_text`** sets a value **instantly** via UIA ValuePattern. Use it for form fields, search boxes, address bars. It targets elements **by name**.
-- **`ds_type`** sends **keystrokes character-by-character** to whatever has focus. Use it for chat inputs (Discord, Slack, Claude.ai), terminals, and apps that reject programmatic text setting.
+- **`ds_text`** sets text in a **named input field**. In browser mode (CDP), it clicks the field and types via keyboard events. In native mode (UIA), it uses ValuePattern for instant injection. **Always preferred.**
+- **`ds_type`** sends **keystrokes character-by-character** into the **currently focused element**. Use it for chat inputs (Discord, Slack), terminals, and apps that reject `ds_text`. It **auto-refocuses** via persisted click coordinates before typing.
+- **`ds_key`** sends a **keyboard shortcut** (e.g., `ctrl+a`, `backspace`, `enter`). It does NOT re-click into the input field — it **preserves selection state**. This means `ds_key("ctrl+a")` → `ds_key("backspace")` works as expected (select all, then delete).
 
-**Try `ds_text` first.** If the app rejects it, fall back to `ds_type`. For `ds_type`, make sure the right element has focus first (click it with `ds_click`).
+**Try `ds_text` first.** Fall back to `ds_type` only when `ds_text` doesn't work. For `ds_type`, click the input field first with `ds_click` — after that, the coordinates are persisted and all subsequent `ds_type` calls will auto-refocus.
+
+**The Auto-Persist Pattern:** When you `ds_click` an element, DirectShell remembers its screen coordinates. All subsequent `ds_type` calls automatically re-click those coordinates before typing, ensuring the input field stays focused. `ds_key` does NOT re-click (to preserve selection state). This persists until you click something else.
+
+**Fail-Safe:** During `ds_type`, if the target application loses foreground focus mid-typing, the action **aborts immediately** — no more 20 seconds of keystrokes going to the wrong window.
 
 ### 2. The Zoom-Out Trick (Content-Heavy Pages)
 
@@ -199,16 +227,24 @@ This is ~10–50 tokens per query. Compare that to a 5,000-token screenshot.
 
 ---
 
-## How to Tell the Human to Snap
+## Snapping to Applications
 
-The human needs to:
+### AI-Native (Recommended): Use `ds_apps()` + `ds_focus()`
 
-1. **Run DirectShell.exe** — double-click the binary (no installation needed)
-2. **Drag the overlay** onto the target application window
-3. The overlay will "snap" to the app — you'll see a frame around it
-4. **That's it.** You now have full read/write access to that application.
+DirectShell runs as a **background daemon** that tracks all open windows every 2 seconds. You can switch between apps programmatically:
 
-To switch apps: tell the human to drag the overlay to a different window. Or use keyboard shortcuts to switch tabs within the same app.
+```
+→ ds_apps()              # Lists: opera, discord, notepad, ...
+→ ds_focus("discord")    # Snaps to Discord (brings to foreground, reads UI)
+→ ds_update_view()       # See Discord's screen
+→ ds_focus("notepad")    # Switch to Notepad (unsnaps Discord first)
+```
+
+No human interaction needed. This is the preferred workflow for AI agents.
+
+### Manual (Legacy): Drag the Overlay
+
+The human can also manually snap by dragging the DirectShell overlay window onto any application. This still works and is useful for initial setup or debugging.
 
 ---
 
@@ -266,11 +302,25 @@ Next time anyone snaps DirectShell to Excel, your profile loads automatically. Y
 
 ---
 
+## Dual-Mode Architecture: CDP vs UIA
+
+DirectShell automatically routes to the right backend:
+
+| App Type | Mode | How Input Works |
+|----------|------|----------------|
+| **Browsers** (Opera, Chrome, Edge, Firefox, Brave, Vivaldi) | **CDP** (Chrome DevTools Protocol) | DOM-level events via WebSocket |
+| **Everything else** (Discord, Notepad, SAP, Excel, ...) | **UIA** (Windows UI Automation) | OS-level `SendInput` (real keyboard/mouse) |
+
+Routing is automatic — you don't need to think about it. The `_BROWSER_APPS` set in the MCP server determines which apps use CDP. All others use UIA.
+
+**All native app input uses `SendInput`** — real OS-level keyboard and mouse events that the target application cannot distinguish from human hardware input. No `PostMessage`, no `WM_CHAR`, no API shortcuts.
+
+---
+
 ## Known Limitations (February 2026)
 
-- **Single-app scope**: DirectShell attaches to one application at a time. Multi-app workflows require re-snapping.
-- **Chromium activation**: Chrome, Edge, Discord, VS Code, Slack, and other Chromium-based apps need a few seconds to build their accessibility tree after snapping. Be patient on first snap.
-- **`ds_type` in Chromium**: The keyboard simulation may produce double characters in some Chromium-based apps. **Always prefer `ds_text`** (ValuePattern) for text input. Only fall back to `ds_type` for apps that reject ValuePattern (chat inputs, terminals).
+- **One active app**: DirectShell focuses one application at a time, but switching is instant via `ds_focus()`. Multi-app workflows just need `ds_focus()` between apps.
+- **Chromium activation**: Chromium-based apps need a few seconds to build their accessibility tree after snapping. Be patient on first snap.
 - **Canvas-rendered content**: Some web apps render on canvas (e.g., Google Sheets cells). The a11y tree shows 0 elements for these. Use `ds_type` with keyboard navigation (Tab, Enter) instead.
 - **Accessibility quality varies**: The tree is only as good as the app's accessibility implementation. Major enterprise software is comprehensive. Smaller apps may have unnamed buttons or missing values.
 - **Windows only (for now)**: macOS (NSAccessibility) and Linux (AT-SPI2) have equivalent frameworks. Cross-platform support is planned.

@@ -241,9 +241,19 @@ _FULLPAGE_TEXT_JS = r'''(() => {
 })()'''
 
 
+_BROWSER_APPS = {"opera", "chrome", "edge", "firefox", "brave", "vivaldi", "chromium"}
+
 def _is_cdp_available() -> bool:
-    """Check if CDP (Chrome DevTools Protocol) is available on port 9222.
-    If yes → browser mode (all actions via CDP). If no → native app mode (all actions via UIA)."""
+    """Check if CDP should be used: snapped app must be a browser AND port 9222 must be open.
+    Non-browser apps (Discord, etc.) always use UIA even if a browser is running in the background."""
+    # Check if snapped app is a browser
+    try:
+        status = _read_active()
+        if status["snapped"] and status["app"] not in _BROWSER_APPS:
+            return False  # Native app snapped — never use CDP
+    except Exception:
+        pass
+    # Check if CDP port is actually open
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(0.3)
@@ -1308,59 +1318,15 @@ def ds_profile_get(app: str, prev_ok: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# VISION TRANSLATOR — Gemini-powered screen understanding
+# SCREEN EXTRACTION — Deterministic, no external LLM
 # ---------------------------------------------------------------------------
-
-_TRANSLATOR_MODEL = "google/gemini-2.5-flash-lite-preview-09-2025"
-_TRANSLATOR_PROMPT = """UI translator. 3 data sources: a11y (text content), snap (operable elements), CDP DOM (browser interactive elements).
-Merge ALL sources. Output 3 sections separated by --- on its own line:
-
-SCREEN
-2-3 sentences. What app/page/state.
-
----
-
-TOOLS
-One line per action. Format: action|"exact_element_name"|description
-- action = click or type or select
-- exact_element_name = EXACT from snap or CDP label
-- Skip decorative, only actionable elements
-
----
-
-DATA
-Visible values: prices, numbers, counts, status.
-One line per value. Plain text. If nothing interesting, write: none"""
 
 # In-memory store for active tools
 _active_view = {"screen": "", "tools": [], "data": "", "raw_tools": []}
 _cdp_labels: set = set()  # CDP element labels from last update_view
 
 
-def _get_openrouter_key() -> str:
-    """Load OpenRouter API key from .env file."""
-    env_path = Path(__file__).resolve().parent.parent.parent.parent / "new-server" / ".env"
-    if not env_path.exists():
-        # Try common locations
-        for p in [
-            Path(r"C:\Users\hacka\Desktop\Neuer-Main-Server\new-server\.env"),
-        ]:
-            if p.exists():
-                env_path = p
-                break
-    with open(env_path, "r") as f:
-        for line in f:
-            if line.startswith("OPENROUTER_API_KEY="):
-                return line.strip().split("=", 1)[1]
-    raise RuntimeError("OPENROUTER_API_KEY not found")
-
-
-# OLD: _get_cdp_elements() and _execute_cdp_action() removed — superseded by _cdp_click/_cdp_type
-
-
-# OLD: _filter_a11y, _filter_snap, _call_translator, _parse_translator_response
-# removed — only used by Gemini translator path which is now disabled.
-# Gemini translator code preserved in ds_update_view() comments below.
+# NOTE: Gemini translator path removed — ds_update_view is now fully deterministic (no LLM).
 
 
 def _cdp_extract() -> dict:
@@ -1446,11 +1412,13 @@ def ds_update_view(prev_ok: str, app: Optional[str] = None) -> str:
     _log_action("ds_update_view", {}, "", prev_ok)
     global _active_view, _cdp_labels
 
-    # --- Deterministic CDP path (no LLM) ---
-    try:
-        cdp = _cdp_extract()
-    except Exception:
-        cdp = None
+    # --- Deterministic CDP path (only for browser apps) ---
+    cdp = None
+    if _is_cdp_available():
+        try:
+            cdp = _cdp_extract()
+        except Exception:
+            cdp = None
 
     if cdp and cdp["tools"]:
         _active_view = {"screen": cdp["text"], "tools": cdp["tools"], "data": ""}

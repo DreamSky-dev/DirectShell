@@ -63,7 +63,7 @@ Windows has had a built-in feature for 25 years that was developed for blind peo
 
 Nobody thought to use this for AI. Until now.
 
-DirectShell is a transparent overlay that snaps onto any application and reads this self-description. Not as a photo. As text. And stores everything in a database that is instantly searchable.
+DirectShell runs as a background daemon that tracks every open window and reads this self-description. Not as a photo. As text. And stores everything in a database that is instantly searchable.
 
 Instead of: *"Here's a photo, guess where the Save button is"*
 
@@ -117,18 +117,18 @@ No screenshots were taken. Everything went through structured text.
 
 ## Architecture
 
-DirectShell is three subsystems in a single ~1.2 MB Rust binary:
+DirectShell is four subsystems in a single ~1.2 MB Rust binary:
 
 ```
 ┌──────────────────────────────────────────────────┐
 │                 LLM / AI Agent                    │  Text in, text out
 ├──────────────────────────────────────────────────┤
 │                  DirectShell                      │  THIS LAYER
-│  ┌─────────────┬──────────────┬────────────────┐ │
-│  │   Overlay   │    Input     │   Feedback     │ │
-│  │   Manager   │   Pipeline   │   Reader       │ │
-│  │   (Snap)    │   (Hooks)    │   (UIA→SQLite) │ │
-│  └─────────────┴──────────────┴────────────────┘ │
+│  ┌─────────┬──────────┬──────────┬────────────┐ │
+│  │ Daemon  │ Overlay  │  Input   │  Feedback  │ │
+│  │ Mode    │ Manager  │ Pipeline │  Reader    │ │
+│  │ (Enum)  │ (Snap)   │(SendInput│ (UIA→SQL)  │ │
+│  └─────────┴──────────┴──────────┴────────────┘ │
 ├──────────────────────────────────────────────────┤
 │              Windows OS (Win32 API)               │
 ├──────────────────────────────────────────────────┤
@@ -136,11 +136,13 @@ DirectShell is three subsystems in a single ~1.2 MB Rust binary:
 └──────────────────────────────────────────────────┘
 ```
 
-**1. Overlay Manager** — A transparent, click-through window that snaps onto any application. Tracks position, size, minimize, and close at 60fps. The target app doesn't know it's there.
+**1. Daemon Mode** — Runs in the background, enumerating all open windows every 2 seconds (`EnumWindows`). Writes `windows.json` so AI agents can see all available apps. Accepts snap requests via file (`snap_request`) — the AI calls `ds_focus("discord")` and DirectShell snaps without human interaction.
 
-**2. Input Pipeline** — Intercepts keyboard and mouse events via low-level hooks (`SetWindowsHookEx`). Can pass through, modify, suppress, or inject input. Uses `SendInput` — the OS itself vouches for the events as legitimate hardware input.
+**2. Overlay Manager** — A transparent, click-through window that snaps onto any application. Tracks position, size, minimize, and close at 60fps. The target app doesn't know it's there. Also supports manual snapping by dragging.
 
-**3. Feedback Reader** — Walks the UI Automation tree every 500ms and writes every element into SQLite (WAL mode). Produces two files:
+**3. Input Pipeline** — All input uses `SendInput` — real OS-level keyboard and mouse events indistinguishable from hardware input. Features auto-persist focus (click an input field once, coordinates are remembered for all subsequent typing) and fail-safe abort (typing stops immediately if the target loses focus).
+
+**4. Feedback Reader** — Walks the UI Automation tree every 500ms and writes every element into SQLite (WAL mode). Produces two files:
   - `.a11y` database — Full element tree (name, role, value, position, enabled state, parent/child)
   - `.snap` file — Compact operable element list for quick reads
 
@@ -207,19 +209,29 @@ sqlite3 ds_profiles/notepad.db "INSERT INTO inject (action, text, target) VALUES
 
 The `ds-mcp/` directory contains a **Model Context Protocol server** — the first program built on top of DirectShell. It is not part of DirectShell itself. DirectShell is the primitive; the MCP server is a tool that demonstrates what you can build on it.
 
-The MCP server exposes DirectShell's capabilities as structured tool calls that any MCP-compatible LLM can invoke:
+The MCP server exposes DirectShell's capabilities as 27 structured tool calls that any MCP-compatible LLM can invoke:
 
 | Tool | Purpose |
 |------|---------|
-| `ds_status` | Check what app is snapped |
-| `ds_state` | Read all operable elements |
-| `ds_screen` | Full screen reader view |
-| `ds_query` | Run SQL against the element database |
+| **App Switching** | |
+| `ds_apps` / `ds_focus` | List apps, switch between them (AI-native, no human needed) |
+| `ds_tabs` / `ds_tab` | List/switch browser tabs (CDP mode) |
+| **Perception** | |
+| `ds_update_view` | Primary tool: visible text + numbered action list |
+| `ds_act` | Execute action by number from update_view |
+| `ds_state` / `ds_elements` | Raw UIA element data |
+| `ds_screen` / `ds_print` | Read viewport text / full page text |
+| `ds_query` / `ds_find` | SQL queries and element search (UIA) |
+| `ds_events` | Delta perception — what changed since last check |
+| **Actions** | |
 | `ds_click` / `ds_text` / `ds_type` / `ds_key` | Control the application |
-| `ds_batch` | Execute multiple actions in sequence |
-| `ds_find` | Search elements by name pattern |
-| `ds_events` | Get live UI change events (delta perception) |
+| `ds_batch` | Multiple actions in one call |
 | `ds_scroll` | Scroll in any direction |
+| `ds_navigate` / `ds_wait` | Browser navigation (CDP) |
+| **Learning** | |
+| `ds_learn` | Read/write per-app tips and quirks |
+| `ds_profile_*` | Semantic element mappings |
+| `ds_guide` | Quick-start guide for new users |
 
 ### MCP Configuration
 
@@ -237,23 +249,11 @@ The MCP server exposes DirectShell's capabilities as structured tool calls that 
 
 > **Important:** The `--profiles` path must point to the same `ds_profiles/` directory where `directshell.exe` writes its databases. If you run the EXE from the repo root, that's `./ds_profiles/`.
 
-### API Key for `ds_update_view`
+### No API Key Required
 
-The `ds_update_view` tool sends accessibility data to a fast, cheap LLM (Gemini Flash 2.5 Lite via [OpenRouter](https://openrouter.ai)) which translates raw element trees into human-readable tool lists. This requires an API key:
+All 27 tools work locally — no external API calls, no cloud dependencies, no cost per operation. `ds_update_view` uses deterministic extraction (CDP for browsers, UIA parsing for native apps) instead of an LLM translation layer.
 
-```bash
-# Option 1: Environment variable
-export OPENROUTER_API_KEY=your_key_here
-
-# Option 2: .env file (in ds-mcp/ or repo root)
-echo "OPENROUTER_API_KEY=your_key_here" > .env
-```
-
-Get a key at [openrouter.ai/keys](https://openrouter.ai/keys). Cost is ~$0.001-0.01 per `ds_update_view` call.
-
-> All other tools (`ds_click`, `ds_text`, `ds_type`, `ds_key`, `ds_query`, etc.) work without any API key — they operate directly through the local accessibility layer.
-
-With this, any LLM using MCP can read and control any Windows application through natural language.
+DirectShell operates in two modes automatically: **CDP** (Chrome DevTools Protocol) for browsers, **UIA** (Windows UI Automation) for everything else. With this, any LLM using MCP can read and control any Windows application through natural language.
 
 ---
 
@@ -317,6 +317,7 @@ DirectShell does not bypass access controls. It does not inject code into other 
 ### Dev Blog
 
 - [`BLOG_DAY2.md`](BLOG_DAY2.md) — Day 2: When an AI Learns to Use a Browser for the First Time (Learnings system, CDP integration)
+- [`BLOG_DAY3.md`](BLOG_DAY3.md) — Day 3: Migraine, Stress, and the Search for the Needle in the Haystack
 
 ---
 
