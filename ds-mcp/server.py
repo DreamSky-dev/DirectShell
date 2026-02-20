@@ -452,6 +452,24 @@ def _cdp_send_keys(ws, text: str, msg_id_start: int = 20) -> None:
         "\t": ("Tab", "Tab", 9, None),      # no text
         "\n": ("Enter", "Enter", 13, "\r"),  # text=\r (Puppeteer convention)
     }
+    # IMPORTANT: Don't use ord(ch) as Windows VK for punctuation.
+    # Example: ord('(')=40 which is VK_DOWN — Chromium drops/mis-handles '('.
+    # Proper mapping for ASCII punctuation (US layout): (code, vk, modifiers).
+    # modifiers=8 means Shift held.
+    punct_map = {
+        "!": ("Digit1", 49, 8), "@": ("Digit2", 50, 8), "#": ("Digit3", 51, 8),
+        "$": ("Digit4", 52, 8), "%": ("Digit5", 53, 8), "^": ("Digit6", 54, 8),
+        "&": ("Digit7", 55, 8), "*": ("Digit8", 56, 8), "(": ("Digit9", 57, 8),
+        ")": ("Digit0", 48, 8),
+        "=": ("Equal", 187, 0), "+": ("Equal", 187, 8), ";": ("Semicolon", 186, 0),
+        ":": ("Semicolon", 186, 8), ",": ("Comma", 188, 0), "<": ("Comma", 188, 8),
+        "-": ("Minus", 189, 0), "_": ("Minus", 189, 8), ".": ("Period", 190, 0),
+        ">": ("Period", 190, 8), "/": ("Slash", 191, 0), "?": ("Slash", 191, 8),
+        "`": ("Backquote", 192, 0), "~": ("Backquote", 192, 8), "[": ("BracketLeft", 219, 0),
+        "{": ("BracketLeft", 219, 8), "]": ("BracketRight", 221, 0), "}": ("BracketRight", 221, 8),
+        "\\": ("Backslash", 220, 0), "|": ("Backslash", 220, 8), "'": ("Quote", 222, 0),
+        "\"": ("Quote", 222, 8),
+    }
     msg_id = msg_id_start
     for ch in text:
         if ch in special_keys:
@@ -468,24 +486,6 @@ def _cdp_send_keys(ws, text: str, msg_id_start: int = 20) -> None:
             }}))
             ws.recv(); msg_id += 1
         else:
-            # IMPORTANT: Don't use ord(ch) as Windows VK for punctuation.
-            # Example: ord('(')=40 which is VK_DOWN. This makes Chromium drop/mis-handle '('.
-            # Minimal fix: properly map only the collision-prone ASCII punctuation set (US layout).
-            punct_map = {
-                "!": ("Digit1", 49, 8), "@": ("Digit2", 50, 8), "#": ("Digit3", 51, 8),
-                "$": ("Digit4", 52, 8), "%": ("Digit5", 53, 8), "^": ("Digit6", 54, 8),
-                "&": ("Digit7", 55, 8), "*": ("Digit8", 56, 8), "(": ("Digit9", 57, 8),
-                "*": ("Digit8", 56, 8), "(": ("Digit9", 57, 8), ")": ("Digit0", 48, 8),
-                "=": ("Equal", 187, 0), "+": ("Equal", 187, 8), ";": ("Semicolon", 186, 0),
-                ":": ("Semicolon", 186, 8), ",": ("Comma", 188, 0), "<": ("Comma", 188, 8),
-                "-": ("Minus", 189, 0), "_": ("Minus", 189, 8), ".": ("Period", 190, 0),
-                ">": ("Period", 190, 8), "/": ("Slash", 191, 0), "?": ("Slash", 191, 8),
-                "`": ("Backquote", 192, 0), "~": ("Backquote", 192, 8), "[": ("BracketLeft", 219, 0),
-                "{": ("BracketLeft", 219, 8), "]": ("BracketRight", 221, 0), "}": ("BracketRight", 221, 8),
-                "\\": ("Backslash", 220, 0), "|": ("Backslash", 220, 8), "'": ("Quote", 222, 0),
-                "\"": ("Quote", 222, 8),
-            }
-
             if ch in punct_map:
                 code, vk, modifiers = punct_map[ch]
                 ws.send(json.dumps({"id": msg_id, "method": "Input.dispatchKeyEvent", "params": {
