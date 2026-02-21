@@ -128,7 +128,6 @@ static DAEMON_SNAP: AtomicBool = AtomicBool::new(false);     // Daemon: skip CDP
 static AGENT_MODE: AtomicBool = AtomicBool::new(false);      // Agent mode: overlay hidden
 static LAST_CLICK_X: AtomicI32 = AtomicI32::new(-1);        // Auto-persist: last click X (absolute screen)
 static LAST_CLICK_Y: AtomicI32 = AtomicI32::new(-1);        // Auto-persist: last click Y (absolute screen)
-static LAST_PROC_CHECK: AtomicIsize = AtomicIsize::new(0);   // Throttle: last process-alive check (ms since start)
 
 fn tgt() -> HWND { HWND(TARGET_HW.load(SeqCst) as *mut _) }
 fn snapped() -> bool { IS_SNAPPED.load(SeqCst) }
@@ -2084,11 +2083,6 @@ unsafe fn enum_windows_to_json() {
         ts, entries.join(",\n")
     );
     let _ = fs::write(WINDOWS_FILE, json);
-    // Heartbeat: touch is_active so MCP knows DS is alive (it checks mtime < 10s)
-    if !snapped() {
-        write_active_status("");
-    }
-    // When snapped, is_active is refreshed in do_sync's 1/sec heartbeat
 }
 
 unsafe fn check_snap_request(me: HWND) {
@@ -2117,9 +2111,6 @@ unsafe fn check_snap_request(me: HWND) {
             DAEMON_SNAP.store(true, SeqCst);
             do_snap(me, target);
             DAEMON_SNAP.store(false, SeqCst);
-
-            // If this is a browser, check CDP and offer restart if needed
-            ensure_browser_cdp(&requested);
 
             let _ = fs::write(SNAP_RESULT_FILE,
                 format!(r#"{{"status":"ok","app":"{}"}}"#, requested));
@@ -2153,41 +2144,7 @@ unsafe fn check_overlay_mode(me: HWND) {
 unsafe fn do_sync(me: HWND) {
     if !snapped() { return; }
     let t = tgt();
-    if t.0.is_null() || !IsWindow(t).as_bool() || !IsWindowVisible(t).as_bool() {
-        log("do_sync: target gone or hidden, unsnapping");
-        do_unsnap(me);
-        return;
-    }
-    // Heartbeat + process-alive check (throttled to 1/sec)
-    {
-        let now_ms = START_TIME.get_or_init(Instant::now).elapsed().as_millis() as isize;
-        let last = LAST_PROC_CHECK.load(SeqCst);
-        if now_ms - last > 1000 {
-            LAST_PROC_CHECK.store(now_ms, SeqCst);
-            // Touch is_active so MCP knows DS is alive (it checks mtime)
-            let db = CURRENT_DB.lock().unwrap().clone();
-            write_active_status(&db);
-            // Is the target process still alive?
-            let mut pid: u32 = 0;
-            GetWindowThreadProcessId(t, Some(&mut pid));
-            if pid == 0 {
-                log("do_sync: target process PID=0, unsnapping");
-                do_unsnap(me);
-                return;
-            }
-            use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-            use windows::Win32::Foundation::CloseHandle;
-            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-            match h {
-                Ok(handle) => { let _ = CloseHandle(handle); }
-                Err(_) => {
-                    log(&format!("do_sync: target process {} dead, unsnapping", pid));
-                    do_unsnap(me);
-                    return;
-                }
-            }
-        }
-    }
+    if t.0.is_null() || !IsWindow(t).as_bool() { log("do_sync: target gone, unsnapping"); do_unsnap(me); return; }
     // Agent mode: overlay always hidden, but still track position for coordinate math
     if AGENT_MODE.load(SeqCst) {
         if IsWindowVisible(me).as_bool() { let _ = ShowWindow(me, SW_HIDE); }
@@ -2703,220 +2660,180 @@ unsafe extern "system" fn wndproc(
     }
 }
 
-// ── Browser CDP Restart ────────────────────────────────
-// When DS snaps to a browser and CDP is not available, offer to restart the browser
-// with the correct CDP flags. This replaces the old shortcut-patching approach —
-// DS now controls the browser launch directly via CreateProcessW.
+// ── Browser Shortcut Patching ────────────────────────
+// At startup: find browser .lnk files on the Desktop, ask user to add CDP + a11y flags.
+// Flags: --remote-debugging-port=9222 (localhost ONLY) + --force-renderer-accessibility
+// This replaces the old "bounce" approach — flags are baked into shortcuts permanently.
 
-const DS_BASE_FLAGS: &str = "--remote-allow-origins=* --force-renderer-accessibility";
-const CDP_PORTS_FILE: &str = "ds_profiles/cdp_ports.json";
+const DS_FLAGS: &str = "--remote-debugging-port=9222 --remote-allow-origins=* --force-renderer-accessibility";
+const BROWSER_EXES: [&str; 6] = ["chrome.exe", "opera.exe", "msedge.exe", "brave.exe", "vivaldi.exe", "chromium.exe"];
+const SHORTCUTS_STATE: &str = "ds_profiles/shortcuts_configured";
+const SHORTCUTS_BACKUP: &str = "ds_profiles/shortcuts_backup.json";
+const REVERT_GUIDE: &str = "ds_profiles/BROWSER_FLAGS_GUIDE.txt";
 
-/// Each browser gets its own CDP port so multiple browsers can run simultaneously.
-const BROWSER_CDP_PORTS: [(&str, u16); 6] = [
-    ("chrome.exe",   9222),
-    ("opera.exe",    9223),
-    ("msedge.exe",   9224),
-    ("brave.exe",    9225),
-    ("vivaldi.exe",  9226),
-    ("chromium.exe", 9227),
-];
+/// Read target path + arguments from a .lnk shortcut file via COM (IShellLinkW)
+unsafe fn read_shortcut_info(lnk_path: &std::path::Path) -> Option<(String, String)> {
+    use windows::Win32::UI::Shell::IShellLinkW;
+    use windows::Win32::System::Com::IPersistFile;
 
-/// UIA app name fragments → browser exe names
-const BROWSER_APP_MAP: [(&str, &str); 8] = [
-    ("google_chrome", "chrome.exe"),
-    ("chrome",        "chrome.exe"),
-    ("opera",         "opera.exe"),
-    ("edge",          "msedge.exe"),
-    ("microsoft_edge","msedge.exe"),
-    ("brave",         "brave.exe"),
-    ("vivaldi",       "vivaldi.exe"),
-    ("chromium",      "chromium.exe"),
-];
+    // CLSID_ShellLink = {00021401-0000-0000-C000-000000000046}
+    let clsid = GUID { data1: 0x00021401, data2: 0x0000, data3: 0x0000,
+        data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46] };
 
-/// Get a NON-DEFAULT user-data-dir for CDP debugging.
-/// Chrome 136+ blocks --remote-debugging-port when using the default profile.
-/// We create a separate DS profile dir that Chrome accepts for debugging.
-/// The dir is persistent so bookmarks/logins survive across restarts.
-fn get_browser_user_data_dir(exe_name: &str) -> Option<String> {
-    let local = std::env::var("LOCALAPPDATA").ok()?;
-    let browser_tag = match exe_name {
-        "chrome.exe"   => "Chrome",
-        "msedge.exe"   => "Edge",
-        "brave.exe"    => "Brave",
-        "vivaldi.exe"  => "Vivaldi",
-        "chromium.exe" => "Chromium",
-        "opera.exe"    => "Opera",
-        _ => return None,
+    let link: IShellLinkW = CoCreateInstance(&clsid, None, CLSCTX_INPROC_SERVER).ok()?;
+    let persist: IPersistFile = link.cast().ok()?;
+
+    let wide: Vec<u16> = lnk_path.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+    persist.Load(PCWSTR(wide.as_ptr()), STGM(0)).ok()?; // STGM_READ = 0
+
+    let mut target_buf = [0u16; 512];
+    link.GetPath(&mut target_buf, std::ptr::null_mut(), 0).ok()?;
+    let target = String::from_utf16_lossy(&target_buf)
+        .trim_end_matches('\0').to_string();
+
+    let mut args_buf = [0u16; 4096];
+    let _ = link.GetArguments(&mut args_buf);
+    let args = String::from_utf16_lossy(&args_buf)
+        .trim_end_matches('\0').to_string();
+
+    Some((target, args))
+}
+
+/// Patch a .lnk shortcut to append DS flags to its arguments
+unsafe fn patch_browser_shortcut(lnk_path: &str, original_args: &str, flags: &str) -> bool {
+    use windows::Win32::UI::Shell::IShellLinkW;
+    use windows::Win32::System::Com::IPersistFile;
+
+    let clsid = GUID { data1: 0x00021401, data2: 0x0000, data3: 0x0000,
+        data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46] };
+
+    let link: IShellLinkW = match CoCreateInstance(&clsid, None, CLSCTX_INPROC_SERVER) {
+        Ok(l) => l, Err(_) => return false,
     };
-    let dir = format!("{}\\DirectShell\\BrowserProfiles\\{}", local, browser_tag);
-    // Create the directory if it doesn't exist
-    let _ = std::fs::create_dir_all(&dir);
-    Some(dir)
-}
-
-/// Resolve UIA app name to browser exe name.
-fn browser_exe_from_app(app_name: &str) -> Option<&'static str> {
-    let app_lower = app_name.to_lowercase();
-    BROWSER_APP_MAP.iter()
-        .find(|(fragment, _)| app_lower.contains(fragment))
-        .map(|(_, exe)| *exe)
-}
-
-/// Get CDP port for a browser exe name.
-fn cdp_port_for_exe(exe_name: &str) -> u16 {
-    BROWSER_CDP_PORTS.iter()
-        .find(|(exe, _)| *exe == exe_name)
-        .map(|(_, p)| *p)
-        .unwrap_or(9222)
-}
-
-/// Check if a TCP port is open on localhost.
-fn is_port_open(port: u16) -> bool {
-    use std::net::TcpStream;
-    use std::time::Duration;
-    TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        Duration::from_millis(300),
-    ).is_ok()
-}
-
-/// Find the full exe path for a browser by searching running processes or known install paths.
-fn find_browser_exe_path(exe_name: &str) -> Option<String> {
-    // Check known install locations
-    let paths: Vec<String> = match exe_name {
-        "chrome.exe" => vec![
-            "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe".into(),
-            "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe".into(),
-        ],
-        "msedge.exe" => vec![
-            "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe".into(),
-            "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe".into(),
-        ],
-        "brave.exe" => vec![
-            format!("{}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
-                std::env::var("LOCALAPPDATA").unwrap_or_default()),
-        ],
-        "vivaldi.exe" => vec![
-            format!("{}\\Vivaldi\\Application\\vivaldi.exe",
-                std::env::var("LOCALAPPDATA").unwrap_or_default()),
-        ],
-        "opera.exe" => vec![
-            format!("{}\\Programs\\Opera GX\\opera.exe",
-                std::env::var("LOCALAPPDATA").unwrap_or_default()),
-            format!("{}\\Programs\\Opera\\opera.exe",
-                std::env::var("LOCALAPPDATA").unwrap_or_default()),
-        ],
-        _ => vec![],
-    };
-    paths.into_iter().find(|p| std::path::Path::new(p).exists())
-}
-
-/// Kill all processes of a browser, wait, then relaunch with CDP flags.
-/// Returns true if CDP port is open after relaunch.
-unsafe fn restart_browser_with_cdp(exe_name: &str) -> bool {
-    let port = cdp_port_for_exe(exe_name);
-    let exe_path = match find_browser_exe_path(exe_name) {
-        Some(p) => p,
-        None => {
-            log(&format!("cdp_restart: cannot find exe path for {}", exe_name));
-            return false;
-        }
+    let persist: IPersistFile = match link.cast() {
+        Ok(p) => p, Err(_) => return false,
     };
 
-    // Build command line with CDP flags
-    let mut cmd = format!("\"{}\" --remote-debugging-port={} {}",
-        exe_path, port, DS_BASE_FLAGS);
-    if let Some(data_dir) = get_browser_user_data_dir(exe_name) {
-        cmd.push_str(&format!(" --user-data-dir=\"{}\"", data_dir));
+    let wide_path: Vec<u16> = lnk_path.encode_utf16().chain(std::iter::once(0)).collect();
+    // STGM_READWRITE = 2
+    if persist.Load(PCWSTR(wide_path.as_ptr()), STGM(2)).is_err() { return false; }
+
+    let new_args = if original_args.is_empty() {
+        flags.to_string()
+    } else {
+        format!("{} {}", original_args, flags)
+    };
+
+    let wide_args: Vec<u16> = new_args.encode_utf16().chain(std::iter::once(0)).collect();
+    if link.SetArguments(PCWSTR(wide_args.as_ptr())).is_err() { return false; }
+
+    // Save in-place (NULL path = save to same file)
+    persist.Save(PCWSTR::null(), TRUE).is_ok()
+}
+
+/// Write the "how to revert" guide in ds_profiles/
+fn write_browser_revert_guide(patched: &[(String, String, String)]) {
+    let mut guide = String::new();
+    guide.push_str("=== DirectShell — Browser Flags Guide ===\n\n");
+    guide.push_str("DirectShell has modified the following browser shortcuts:\n\n");
+
+    for (path, name, original_args) in patched {
+        guide.push_str(&format!("  Shortcut: {}\n", name));
+        guide.push_str(&format!("  Path: {}\n", path));
+        guide.push_str(&format!("  Original arguments: {}\n",
+            if original_args.is_empty() { "(none)" } else { original_args }));
+        guide.push_str(&format!("  Added: {}\n\n", DS_FLAGS));
     }
-    log(&format!("cdp_restart: killing {} processes...", exe_name));
 
-    // Kill all processes of this browser
-    let kill_cmd = format!("taskkill /F /IM {} /T", exe_name);
-    // (kill command built inline below)
+    guide.push_str("--- What was added? ---\n\n");
+    guide.push_str("  --remote-debugging-port=9222\n");
+    guide.push_str("    Chrome DevTools Protocol (CDP) on port 9222.\n");
+    guide.push_str("    ONLY reachable from this PC (localhost/127.0.0.1).\n");
+    guide.push_str("    Allows AI agents to control the browser.\n\n");
+    guide.push_str("  --remote-allow-origins=*\n");
+    guide.push_str("    Allows local programs to connect via WebSocket.\n\n");
+    guide.push_str("  --force-renderer-accessibility\n");
+    guide.push_str("    Forces the browser to build its Accessibility Tree.\n");
+    guide.push_str("    Allows AI agents to read and interact with UI elements.\n\n");
 
-    use windows::Win32::System::Threading::{CreateProcessW, STARTUPINFOW, PROCESS_INFORMATION,
-        CREATE_NO_WINDOW, WaitForSingleObject};
+    guide.push_str("--- Revert manually ---\n\n");
+    guide.push_str("  1. Right-click the browser shortcut > Properties\n");
+    guide.push_str("  2. In the 'Target' field, remove the three flags at the end:\n");
+    guide.push_str(&format!("     {}\n", DS_FLAGS));
+    guide.push_str("  3. Click OK. Done.\n\n");
 
-    let mut si: STARTUPINFOW = std::mem::zeroed();
-    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-    let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+    guide.push_str("--- Revert via agent ---\n\n");
+    guide.push_str("  The original arguments are saved in ds_profiles/shortcuts_backup.json.\n");
+    guide.push_str("  An agent can restore the shortcuts from that backup.\n\n");
 
-    let mut kill_line: Vec<u16> = format!("cmd.exe /C {}\0", kill_cmd).encode_utf16().collect();
-    if CreateProcessW(
-        PCWSTR::null(), PWSTR(kill_line.as_mut_ptr()),
-        None, None, FALSE, CREATE_NO_WINDOW, None, PCWSTR::null(),
-        &si, &mut pi,
-    ).is_ok() {
-        WaitForSingleObject(pi.hProcess, 5000);
-        let _ = windows::Win32::Foundation::CloseHandle(pi.hProcess);
-        let _ = windows::Win32::Foundation::CloseHandle(pi.hThread);
+    guide.push_str("--- Is this safe? ---\n\n");
+    guide.push_str("  YES. Port 9222 is NOT reachable from the network.\n");
+    guide.push_str("  It is only accessible from this PC (127.0.0.1).\n");
+    guide.push_str("  It is the same port that Chrome DevTools (F12) uses.\n");
+    guide.push_str("  The accessibility flags have minimal performance impact.\n");
+
+    let _ = fs::write(REVERT_GUIDE, guide);
+}
+
+/// Main shortcut check — runs once at startup, shows popup if unpatched browsers found
+unsafe fn check_browser_shortcuts() {
+    if std::path::Path::new(SHORTCUTS_STATE).exists() { return; }
+    let _ = fs::create_dir_all(DB_DIR);
+
+    // Collect desktop paths
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    if home.is_empty() { return; }
+    let mut desktops = vec![format!("{}\\Desktop", home)];
+    if let Ok(public) = std::env::var("PUBLIC") {
+        desktops.push(format!("{}\\Desktop", public));
     }
 
-    // Wait for processes to fully exit
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    log(&format!("cdp_restart: launching {} on port {}", exe_name, port));
-    log(&format!("cdp_restart: cmd = {}", cmd));
-
-    // Launch browser with CDP flags
-    let mut si2: STARTUPINFOW = std::mem::zeroed();
-    si2.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-    let mut pi2: PROCESS_INFORMATION = std::mem::zeroed();
-    let mut cmd_wide: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
-
-    if CreateProcessW(
-        PCWSTR::null(), PWSTR(cmd_wide.as_mut_ptr()),
-        None, None, FALSE, windows::Win32::System::Threading::PROCESS_CREATION_FLAGS(0),
-        None, PCWSTR::null(),
-        &si2, &mut pi2,
-    ).is_err() {
-        log(&format!("cdp_restart: CreateProcessW FAILED for {}", exe_name));
-        return false;
-    }
-    let _ = windows::Win32::Foundation::CloseHandle(pi2.hProcess);
-    let _ = windows::Win32::Foundation::CloseHandle(pi2.hThread);
-
-    // Wait for CDP port to become available (up to 8 seconds)
-    for i in 0..16 {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        if is_port_open(port) {
-            log(&format!("cdp_restart: CDP port {} open after {}ms", port, (i + 1) * 500));
-            return true;
+    // Scan for browser .lnk files that need patching
+    let mut to_patch: Vec<(String, String, String)> = Vec::new(); // (path, name, original_args)
+    for desktop in &desktops {
+        let Ok(entries) = fs::read_dir(desktop) else { continue; };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("lnk") { continue; }
+            if let Some((target, args)) = read_shortcut_info(&path) {
+                let target_lower = target.to_lowercase();
+                if BROWSER_EXES.iter().any(|exe| target_lower.ends_with(exe))
+                    && !args.contains("--remote-debugging-port")
+                {
+                    let name = path.file_stem().and_then(|s| s.to_str())
+                        .unwrap_or("?").to_string();
+                    to_patch.push((path.to_string_lossy().to_string(), name, args));
+                }
+            }
         }
     }
-    log(&format!("cdp_restart: CDP port {} NOT open after 8s", port));
-    false
-}
 
-/// Called after do_snap when the target is a browser.
-/// Checks if CDP is available; if not, shows popup and offers restart.
-unsafe fn ensure_browser_cdp(app_name: &str) {
-    let exe_name = match browser_exe_from_app(app_name) {
-        Some(e) => e,
-        None => return, // Not a known browser
-    };
-    let port = cdp_port_for_exe(exe_name);
-
-    // CDP already running? Great, nothing to do.
-    if is_port_open(port) {
-        log(&format!("ensure_cdp: {} CDP port {} already open", app_name, port));
+    if to_patch.is_empty() {
+        log("shortcuts: no unpatched browser shortcuts found");
+        let _ = fs::write(SHORTCUTS_STATE, "no_browsers");
         return;
     }
 
-    log(&format!("ensure_cdp: {} CDP port {} NOT open — offering restart", app_name, port));
+    log(&format!("shortcuts: found {} browser shortcuts to patch", to_patch.len()));
 
-    // Show popup
+    // Build popup message
+    let names = to_patch.iter()
+        .map(|(_, n, _)| format!("  \u{2022} {}", n))
+        .collect::<Vec<_>>().join("\n");
     let msg = format!(
-        "DirectShell needs CDP (Chrome DevTools Protocol) to control this browser.\n\n\
-         Browser: {}\n\
-         CDP Port: {}\n\n\
-         The browser will restart with a separate DirectShell profile.\n\
-         Your original profile and tabs remain untouched.\n\
-         (Profile location: %LOCALAPPDATA%\\DirectShell\\BrowserProfiles)\n\n\
-         Restart now?\0",
-        app_name, port
+        "DirectShell found {} browser shortcut(s) on the desktop:\n\n\
+         {}\n\n\
+         May DirectShell add developer flags to these shortcuts?\n\n\
+         What will be added:\n\
+         \u{2022} CDP (port 9222) \u{2014} remote control, ONLY reachable locally\n\
+         \u{2022} Accessibility \u{2014} Accessibility Tree for AI agents\n\n\
+         No security risk \u{2014} port 9222 is exclusively\n\
+         reachable from this PC (localhost/127.0.0.1).\n\n\
+         A guide to revert these changes is saved in:\n\
+         ds_profiles\\BROWSER_FLAGS_GUIDE.txt\0",
+        to_patch.len(), names
     );
-    let title = "DirectShell \u{2014} Browser Restart Required\0";
+    let title = "DirectShell \u{2014} Browser Configuration\0";
     let wide_msg: Vec<u16> = msg.encode_utf16().collect();
     let wide_title: Vec<u16> = title.encode_utf16().collect();
 
@@ -2924,23 +2841,89 @@ unsafe fn ensure_browser_cdp(app_name: &str) {
         HWND::default(),
         PCWSTR(wide_msg.as_ptr()),
         PCWSTR(wide_title.as_ptr()),
-        MB_OKCANCEL | MB_ICONQUESTION,
+        MB_YESNO | MB_ICONQUESTION,
     );
 
-    if result == MESSAGEBOX_RESULT(1) { // IDOK
-        if restart_browser_with_cdp(exe_name) {
-            log(&format!("ensure_cdp: {} restarted with CDP successfully", app_name));
+    if result == MESSAGEBOX_RESULT(6) { // IDYES
+        // Backup original args
+        let backup: Vec<_> = to_patch.iter().map(|(p, n, a)| {
+            format!(r#"  {{"path":"{}","name":"{}","original_args":"{}"}}"#,
+                json_escape(p), json_escape(n), json_escape(a))
+        }).collect();
+        let _ = fs::write(SHORTCUTS_BACKUP, format!("[\n{}\n]", backup.join(",\n")));
+
+        let mut patched_ok: Vec<String> = Vec::new();
+        let mut patched_fail: Vec<String> = Vec::new();
+        for (path, name, args) in &to_patch {
+            if patch_browser_shortcut(path, args, DS_FLAGS) {
+                log(&format!("shortcuts: patched '{}'", name));
+                patched_ok.push(name.clone());
+            } else {
+                log(&format!("shortcuts: FAILED to patch '{}' (access denied?)", name));
+                patched_fail.push(name.clone());
+            }
+        }
+
+        write_browser_revert_guide(&to_patch);
+        log(&format!("shortcuts: {}/{} browser shortcuts patched", patched_ok.len(), to_patch.len()));
+
+        if patched_fail.is_empty() {
+            // All good — save state and show success
+            let _ = fs::write(SHORTCUTS_STATE, format!("patched:{}", patched_ok.len()));
+            let done_msg = format!("{} of {} browser shortcut(s) configured.\n\n\
+                Changes will be active on next browser launch.\0",
+                patched_ok.len(), to_patch.len());
+            let wide_done: Vec<u16> = done_msg.encode_utf16().collect();
+            MessageBoxW(HWND::default(), PCWSTR(wide_done.as_ptr()),
+                PCWSTR(wide_title.as_ptr()), MB_OK | MB_ICONINFORMATION);
         } else {
+            // Some failed — offer admin restart
             let fail_msg = format!(
-                "Browser restart failed.\n\n\
-                 CDP port {} did not open.\n\
-                 DirectShell will continue in UIA-only mode.\0", port);
+                "{} of {} shortcut(s) configured.\n\n\
+                 Failed (admin rights needed):\n  {}\n\n\
+                 Restart DirectShell as Administrator to fix these?\n\n\
+                 If you click No, you can manually fix them:\n\
+                 Right-click shortcut > Properties > Target, append:\n\
+                 {}\0",
+                patched_ok.len(), to_patch.len(),
+                patched_fail.join("\n  "), DS_FLAGS);
             let wide_fail: Vec<u16> = fail_msg.encode_utf16().collect();
-            MessageBoxW(HWND::default(), PCWSTR(wide_fail.as_ptr()),
-                PCWSTR(wide_title.as_ptr()), MB_OK | MB_ICONWARNING);
+            let answer = MessageBoxW(HWND::default(), PCWSTR(wide_fail.as_ptr()),
+                PCWSTR(wide_title.as_ptr()), MB_YESNO | MB_ICONWARNING);
+
+            if answer == MESSAGEBOX_RESULT(6) { // IDYES — restart elevated
+                log("shortcuts: user chose admin restart");
+                // DO NOT write state file — elevated instance will re-scan
+                // Get our own exe path
+                let mut exe_buf = [0u16; 512];
+                let len = GetModuleFileNameW(HMODULE::default(), &mut exe_buf);
+                if len > 0 {
+                    let exe_path = String::from_utf16_lossy(&exe_buf[..len as usize]);
+                    let wide_runas: Vec<u16> = "runas\0".encode_utf16().collect();
+                    let wide_exe: Vec<u16> = exe_path.encode_utf16().chain(std::iter::once(0)).collect();
+                    let wide_dir: Vec<u16> = ".\0".encode_utf16().collect();
+                    use windows::Win32::UI::Shell::ShellExecuteW;
+                    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+                    ShellExecuteW(
+                        HWND::default(),
+                        PCWSTR(wide_runas.as_ptr()),
+                        PCWSTR(wide_exe.as_ptr()),
+                        PCWSTR::null(),
+                        PCWSTR(wide_dir.as_ptr()),
+                        SW_SHOWNORMAL,
+                    );
+                    log("shortcuts: launched elevated instance, exiting");
+                    std::process::exit(0);
+                }
+            } else {
+                // User declined admin — save partial state
+                let _ = fs::write(SHORTCUTS_STATE, format!("partial:{}", patched_ok.len()));
+                log("shortcuts: user declined admin restart");
+            }
         }
     } else {
-        log(&format!("ensure_cdp: user declined restart for {}", app_name));
+        let _ = fs::write(SHORTCUTS_STATE, "declined");
+        log("shortcuts: user declined");
     }
 }
 
@@ -2955,29 +2938,6 @@ fn main() -> Result<()> {
         }
     }
 
-    // ── Set CWD to EXE directory ──────────────────────────────────────
-    // All paths (ds_profiles/, log, etc.) are relative.
-    // Without this, CWD depends on how the EXE was launched (shortcut, terminal, etc.)
-    // and ds_profiles/ ends up in random locations.
-    {
-        let mut exe_buf = [0u16; 512];
-        let len = unsafe { GetModuleFileNameW(HMODULE::default(), &mut exe_buf) } as usize;
-        if len > 0 {
-            let exe_path = String::from_utf16_lossy(&exe_buf[..len]);
-            if let Some(dir) = std::path::Path::new(&exe_path).parent() {
-                let _ = std::env::set_current_dir(dir);
-                // Write breadcrumb so MCP server can discover ds_profiles automatically
-                if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
-                    let bc_dir = std::path::Path::new(&local_app).join("DirectShell");
-                    let _ = fs::create_dir_all(&bc_dir);
-                    let abs_profiles = dir.join(DB_DIR);
-                    let _ = fs::write(bc_dir.join("profiles_path.txt"),
-                                      abs_profiles.to_string_lossy().as_bytes());
-                }
-            }
-        }
-    }
-
     // Clear stale snap state from previous session
     write_active_status("");
     log("=== DirectShell START ===");
@@ -2986,9 +2946,8 @@ fn main() -> Result<()> {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         log("COM initialized");
 
-        // Write cdp_ports.json so the MCP server knows port assignments
-        let ports_content = "{\n  \"chrome\": 9222,\n  \"opera\": 9223,\n  \"edge\": 9224,\n  \"brave\": 9225,\n  \"vivaldi\": 9226,\n  \"chromium\": 9227\n}";
-        let _ = fs::write(CDP_PORTS_FILE, ports_content);
+        // Browser-Verknüpfungen prüfen und ggf. CDP+UIA Flags anbieten
+        check_browser_shortcuts();
 
         // Screen Reader Flag SOFORT setzen — bevor irgendwas passiert.
         // Apps die NACH DirectShell starten sehen das Flag von Anfang an.
